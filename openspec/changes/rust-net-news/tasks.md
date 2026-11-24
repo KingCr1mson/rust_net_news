@@ -221,15 +221,81 @@ Lefthook 因找不到脚本只会打印跳过提示，门禁实际未生效。
 - `openspec validate rust-net-news --strict`：`Change 'rust-net-news' is valid`。
 - 工作区：`Cargo.lock` 仍未提交（锁文件需人工批准），另有他人留下的未提交修改 `openspec/changes/rust-net-news/design.md`（D6），本轮未动。
 
+### 二次审查修复（R1–R5）
+
+codex 复审（HEAD `1e93d31`）提出的问题及本轮修复提交（未 push）：
+
+| 问题 | 提交 | 内容 |
+| --- | --- | --- |
+| R1（阻塞） | `a47d606` | 删除排序的 `url` 兜底键，恢复“三键相同保持输入顺序”的稳定语义 |
+| R2（阻塞） | `849ce71` | `check-full.sh` 改用 `openspec validate --all --strict` |
+| R3（阻塞） | `49c6886` | `news-fetching` 的 Purpose 补到 63 字，含单源超时/部分成功语义 |
+| R4 | `cb5f644` | 并发用例改为 `Barrier(2)` 确定性重叠检测 |
+| R5 | `0250ae3` | 任务 1.2 依赖清单去掉 anyhow |
+
+R1：
+
+- RED（先写用例，当前实现仍带兜底键）：
+  - `today::tests::identical_keys_keep_input_order`：
+    `left: ["/a", "/b", "/z"]` / `right: ["/z", "/a", "/b"]`。
+  - `parse::tests::identical_keys_from_rss_keep_parse_order_after_sorting`（最小 RSS，两条三键相同，解析顺序 `/z`、`/a`）：
+    `left: ["https://example.com/a", "https://example.com/z"]` / `right: ["https://example.com/z", "https://example.com/a"]`。
+  - `cargo test identical_keys` → 2 failed。
+- GREEN：删除 `.then_with(|| a.url.cmp(&b.url))`，注释改为说明“三键相同保持输入顺序”；
+  `cargo test identical_keys` → 2 passed。
+
+R2 / R3：
+
+- `scripts/check-full.sh` 末段由 `openspec validate rust-net-news --strict` 改为 `openspec validate --all --strict`，
+  并保留 `openspec` 缺失时报错并以非零码退出（用空 PATH 单独运行该 `if` 块验证：输出错误信息、退出码 1）。
+- 归档后旧命令确实失败（在临时目录执行 `openspec validate rust-net-news --strict` →
+  `Unknown item 'rust-net-news'. Did you mean: news-fetching, news-output?`，退出码 1），证明原写死变更名确会破坏归档后的门禁。
+
+归档模拟（在 `/tmp/archive-sim` 副本中进行，未改动真实仓库）：
+
+1. `rsync -a --exclude target ./ /tmp/archive-sim/`
+2. `cd /tmp/archive-sim && openspec archive rust-net-news --yes`
+   → `news-fetching: create`、`news-output: create`，`Change 'rust-net-news' archived as '2026-11-24-rust-net-news'`，退出码 0。
+3. `openspec validate --all --strict` → `✓ spec/news-fetching`、`✓ spec/news-output`，`2 passed, 0 failed`，退出码 0。
+   归档后主规约 `news-fetching` 的 Purpose 为 63 字，满足 50 字下限（R3）。
+4. `bash scripts/check-full.sh`（临时目录，从零编译）→ 退出码 0，末尾 `openspec validate --all --strict` 输出两 spec 均通过。
+5. `rm -rf /tmp/archive-sim`，已确认目录不存在。
+
+R4：
+
+- 新实现：两个本地 `TcpListener` 各自读到请求后都 `barrier.wait()`（`tokio::sync::Barrier(2)`）才返回 RSS；
+  外层 `tokio::time::timeout(Duration::from_secs(5), fetch_all(...))`。断言两源共返回 6 条且无失败源。
+- 串行 RED 验证（临时把 `fetch_all` 改为顺序 `await`，验证后 `git checkout` 恢复，未提交）：
+  `两个源应并发获取：串行实现下第一个请求会等不到第二个请求: Elapsed(())`，用 5.03s 失败；恢复后 9 项 `tests/fetch.rs` 全部通过。
+- `dev-dependencies` 的 tokio 显式加入 `sync` 特性（`Cargo.toml`），不再依赖传递特性。
+
+R5：任务 1.2 依赖清单删除 `anyhow` 并注明“anyhow 已按 design D6 删除，见验证记录的‘依赖说明’”，勾选状态不变。
+
+本轮验证（HEAD = `0250ae3`）：
+
+- `cargo fmt --check`：退出码 0。
+- `cargo clippy --all-targets -- -D warnings`：退出码 0，无警告。
+- `cargo test --offline`：退出码 0，60 项离线测试通过（lib 43、tests/cli.rs 2、tests/fetch.rs 9、main.rs 6），3 项联网测试忽略。
+- `bash scripts/check-fast.sh`：退出码 0。
+- `bash scripts/check-full.sh`：退出码 0，末尾 `✓ change/rust-net-news`、`1 passed, 0 failed`。
+- `openspec validate --all --strict`：退出码 0（`1 passed`）；`openspec validate rust-net-news --strict`：`Change 'rust-net-news' is valid`。
+- `cargo test -- --ignored --test-threads=1`（真实联网）：退出码 0，3 项通过（5.68s）。
+- `cargo run --quiet`：退出码 0，标准错误 0 字节，80 条（`来源：` 标记 80 个、`----` 分隔 79 个）。
+- `cargo run --quiet -- --json`：首次运行 Hacker News 发送请求失败
+  （标准错误：`源获取失败：源 Hacker News 请求失败：error sending request for url (https://hnrss.org/frontpage)`，
+  退出码 0、JSON 60 条，符合“部分失败仍返回 0 并记录失败源”的规约）；
+  立即重跑退出码 0、标准错误 0 字节、80 条（IT之家 60、Hacker News 20），字段集合
+  `published_at, source, summary, title, url`，倒序检查通过。
+
 ### 未覆盖的场景与剩余风险
 
 - 未覆盖 XML 命名空间、Atom 格式的单独回归（`feed-rs` 负责解析；当前两个内置源均为 RSS 2.0）。
 - 条目时间只取 `published`（RSS 的 `pubDate`、Atom 的 `published`）；只有 `updated` / `atom:updated` 的条目按规约丢弃，
   因此只提供 `updated` 的纯 Atom 源会解析出 0 条。当前两个内置源均为 RSS 2.0，不受影响；未来接入 Atom 源需确认其提供 `published`。
-- 排序在发布时间、来源、标题之外增加链接作为兜底键，保证三个既有键完全相同的条目得到与输入顺序无关的确定性输出；
-  规约只约束前三个键，兜底键不与其冲突。
-- 并发用例用“两个源各延迟 300ms、总耗时 < 500ms”区分并发与串行（串行约 600ms）。若 CI 机器极慢该断言可能误报，
-  目前余量为 190ms。
+- 排序在发布时间、来源、标题之外不再有兜底键：三个键都相同的条目保持输入相对顺序（`sort_by` 是稳定排序，符合规约的“稳定”要求），
+  因此完全相同的条目的最终顺序取决于各源的解析/合并顺序。
+- 并发用例改为确定性重叠检测（两个本地服务等 `tokio::sync::Barrier(2)` 齐备后才响应，外层 5 秒超时判定串行），
+  不再依赖毫秒级墙钟阈值。
 - JSON Feed（`feed-rs` 能解析）现按非 RSS/Atom 处理，记为 `SourceError::Parse`；若将来需要支持需另立变更。
 - 摘要 HTML 标签为简单字符扫描（非标准 HTML 解析器），未处理 `&amp;` 等实体解码与 CDATA 边界情况。
 - 时区固定 UTC+8，不支持其他时区。
