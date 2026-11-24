@@ -19,9 +19,10 @@ cargo test
 echo "==> cargo build --all-targets"
 cargo build --all-targets
 
-echo "==> openspec validate rust-net-news --strict"
+echo "==> openspec validate --all --strict"
 if ! command -v openspec >/dev/null 2>&1; then
   echo "错误：未找到 openspec 命令，无法校验规约。请安装 OpenSpec 后重试。" >&2
   exit 1
 fi
-openspec validate rust-net-news --strict
+# 校验全部活跃变更与主规约：归档后本变更不再存在，写死变更名会让门禁失败。
+openspec validate --all --strict
