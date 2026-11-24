@@ -101,7 +101,12 @@
 - `reqwest 0.13.5`：0.13 已将 `rustls-tls` 特性改名为 `rustls`，实际配置为
   `default-features = false, features = ["rustls", "http2"]`。
 - `tokio 1.54.1`、`feed-rs 3.0.0`、`serde 1.0.229`、`serde_json 1.0.154`、`chrono 0.4.45`、
-  `anyhow 1.0.105`、`thiserror 2.0.21`、dev 依赖 `wiremock 0.6.5`。
+  `thiserror 2.0.21`、dev 依赖 `wiremock 0.6.5`。
+- `anyhow` 已删除（提交 `921a216`，`chore: 删除未使用的 anyhow 依赖（与 design D6 一致）`）：
+  design D6 修订后二进制入口不使用 `anyhow`，`run()` 显式返回退出码 `u8`，库层错误由 `thiserror` 定义的
+  `SourceError` 承载。删除前 `rg -n anyhow src/ tests/` 无命中，即该依赖未被使用。验证：删除后
+  `cargo build` 退出码 0，`cargo test` 退出码 0（59 项离线测试通过、3 项联网测试忽略）。
+  `Cargo.lock` 已由 cargo 自动更新但未提交（锁文件需人工批准，保持未跟踪）。
 - 未引入 `assert_cmd`：命令行参数测试改用 `env!("CARGO_BIN_EXE_rust_net_news")` 直接启动二进制（`tests/cli.rs`）。
 
 ### 分组验证
@@ -134,6 +139,9 @@
 - 首次执行时 `live_all_builtin_sources_succeed` 曾失败一次（3 个联网测试并发请求真实站点，总耗时 10.02 秒，
   有一源请求触及 10 秒超时）；把断言补充为输出失败原因后单独重跑通过，随后两次全量重跑均通过。
   剩余风险：联网测试在源站限流或网络抖动时会不稳定，属于外部依赖的既有风险。
+- 风险接受：上述偶发超时已由用户确认接受。规约规定的单次请求 10 秒超时保持不变，联网测试不放宽、
+  不改断言；因此联网测试不进入任何自动门禁（见下文“门禁脚本”），需要时人工执行
+  `cargo test -- --ignored --test-threads=1`。
 
 ### 快检与规约
 
@@ -141,6 +149,29 @@
 - `cargo clippy --all-targets -- -D warnings`：通过，无警告。
 - `cargo test`：59 项离线测试通过（lib 42、tests/cli.rs 2、tests/fetch.rs 9、main.rs 6），3 项联网测试按 `#[ignore]` 忽略。
 - `openspec validate rust-net-news --strict`：`Change 'rust-net-news' is valid`。
+
+### 门禁脚本
+
+提交 `351a97d`（`chore: 新增 scripts/check-fast.sh 与 check-full.sh 门禁脚本`）新增两个脚本。此前
+Lefthook 因找不到脚本只会打印跳过提示，门禁实际未生效。
+
+- `scripts/check-fast.sh`（提交前快检）：`cargo fmt --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test`。
+- `scripts/check-full.sh`（推送前完整检查）：先执行快检的全部内容，再加 `cargo build --all-targets` 与
+  `openspec validate rust-net-news --strict`；`openspec` 不在 PATH 时直接报错退出，不静默跳过
+  （已用不含 `openspec` 的受限 PATH 验证该分支输出错误信息并以非零码退出）。
+- 两个脚本均为 `#!/usr/bin/env bash` + `set -euo pipefail`，先 `cd "$(dirname "$0")/.."` 切到项目根目录，
+  任一命令失败即非零退出，并已 `chmod +x`。
+- 联网测试（`--ignored`）刻意不放进 `check-full.sh`：它依赖真实外网且偶发超过 10 秒超时（已接受的风险），
+  放进推送门禁会让门禁随机失败。该理由已写入脚本注释。
+
+本次运行结果（HEAD = `921a216`，`anyhow` 已删除）：
+
+- `cargo build`：退出码 0。
+- `cargo test`：退出码 0（59 项离线测试通过、3 项联网测试忽略）。
+- `bash scripts/check-fast.sh`：退出码 0（fmt、clippy、test 三段全通过）。
+- `bash scripts/check-full.sh`：退出码 0，末尾输出 `Change 'rust-net-news' is valid`。
+- 提交 `351a97d` 时 Lefthook 的 `fast-checks` 已真实执行 `scripts/check-fast.sh` 并通过（0.91 秒），
+  `block-protected-paths` 同时通过，未使用 `--no-verify` 或 `ALLOW_PROTECTED_PATHS`。
 
 ### 独立审查修复（问题 A–E）
 
