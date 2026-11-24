@@ -1,7 +1,7 @@
 //! RSS / Atom 解析与摘要清理。
 
 use chrono::{DateTime, FixedOffset, Utc};
-use feed_rs::model::Entry;
+use feed_rs::model::{Entry, FeedType};
 
 use crate::error::SourceError;
 use crate::model::NewsItem;
@@ -24,6 +24,21 @@ pub fn parse_feed(body: &[u8], source_name: &str) -> Result<Vec<NewsItem>, Sourc
         source_name: source_name.to_string(),
         reason: err.to_string(),
     })?;
+
+    // 只接受 RSS（0.9x / 1.0 / 2.0）与 Atom；其它已识别格式（如 JSON Feed）
+    // 不符合本系统的输入契终，属于源失败。
+    if !matches!(
+        feed.feed_type,
+        FeedType::Atom | FeedType::RSS0 | FeedType::RSS1 | FeedType::RSS2
+    ) {
+        return Err(SourceError::Parse {
+            source_name: source_name.to_string(),
+            reason: format!(
+                "不支持的 feed 格式 {:?}，只接受 RSS 或 Atom",
+                feed.feed_type
+            ),
+        });
+    }
 
     Ok(feed
         .entries
@@ -172,6 +187,24 @@ mod tests {
   </entry>
 </feed>"#;
 
+    /// 合法的最小 JSON Feed 1.1：feed-rs 能解析，但不是 RSS / Atom，必须视为源解析失败。
+    const JSON_FEED: &str = r#"
+{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "JSON Feed 测试源",
+  "home_page_url": "https://example.com/",
+  "feed_url": "https://example.com/feed.json",
+  "items": [
+    {
+      "id": "https://example.com/json-item-1",
+      "url": "https://example.com/json-item-1",
+      "title": "JSON Feed 条目",
+      "content_text": "该条目来自 JSON Feed。",
+      "date_published": "2026-11-24T04:58:53Z"
+    }
+  ]
+}"#;
+
     #[test]
     fn drops_rss_item_with_only_updated_time() {
         let items =
@@ -192,6 +225,18 @@ mod tests {
             "只有更新时间、没有发布时间的 Atom 条目必须被丢弃，实际保留：{:?}",
             items.iter().map(|item| &item.title).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn json_feed_is_parse_error() {
+        let err = parse_feed(JSON_FEED.as_bytes(), "IT之家")
+            .expect_err("JSON Feed 不是 RSS / Atom，应视为源解析失败");
+        assert!(
+            matches!(err, SourceError::Parse { .. }),
+            "错误类型应为 Parse：{err}"
+        );
+        assert!(err.to_string().contains("IT之家"), "缺少源名称：{err}");
+        assert!(err.to_string().contains("解析失败"), "缺少原因：{err}");
     }
 
     #[test]
