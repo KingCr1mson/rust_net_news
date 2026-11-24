@@ -327,4 +327,12 @@ R5：任务 1.2 依赖清单删除 `anyhow` 并注明“anyhow 已按 design D6 
 - 时区固定 UTC+8，不支持其他时区。
 - 新闻源只返回最新 N 条，当天较早的条目可能不在 feed 中。
 - 真实源内容与日期会随时间变化：fixtures 录制于 2026-11-24，若上游字段样式大改，fixtures 需要重新录制。
-- `Cargo.lock` 未纳入版本库，构建结果的依赖解析未锁定；是否提交需人工决策。
+- `Cargo.lock` 已在 `cac0927` 提交（人工批准，`ALLOW_PROTECTED_PATHS=1`），依赖解析已锁定；后续依赖变更须同步更新锁文件。
+
+### 归档前独立复审（第四轮）
+
+- 审查对象 HEAD `51a4647`，codex `gpt-6.2-sol` 只读复审结论：**通过**，归档前剩余前提为空。
+- 核对：重定向语义在规约、`src/fetch.rs`（默认跟随、以最终状态判定）与两条回归用例中一致；R1–R5 保持；`src/` 自 `cac0927` 无改动。
+- 门禁：`cargo fmt --check`、`clippy -D warnings`、`cargo test --offline`（62 通过，3 联网忽略）、`check-fast.sh`、`check-full.sh`、`openspec validate --all --strict` 均退出 0。
+- 归档模拟在临时目录完成，归档后主规约严格校验通过；真实仓库在正式归档前未做归档。
+- 复审未覆盖：多跳重定向、非 HTTP(S) `Location`、跨域跳转的单独回归；三个真实源联网用例未在复审中运行。
