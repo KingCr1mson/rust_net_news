@@ -308,6 +308,47 @@ mod tests {
         );
     }
 
+    /// 两条只有链接不同的最小 RSS 条目：发布时间、来源、标题完全一致。
+    const RSS_IDENTICAL_KEYS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>三键相同测试源</title>
+    <link>https://example.com/</link>
+    <description>测试用 RSS 源</description>
+    <item>
+      <title>同名条目</title>
+      <link>https://example.com/z</link>
+      <pubDate>Tue, 24 Nov 2026 04:58:53 GMT</pubDate>
+    </item>
+    <item>
+      <title>同名条目</title>
+      <link>https://example.com/a</link>
+      <pubDate>Tue, 24 Nov 2026 04:58:53 GMT</pubDate>
+    </item>
+  </channel>
+</rss>"#;
+
+    #[test]
+    fn identical_keys_from_rss_keep_parse_order_after_sorting() {
+        let mut items =
+            parse_feed(RSS_IDENTICAL_KEYS.as_bytes(), "三键相同测试源").expect("解析成功");
+        // 解析顺序为 /z、/a。
+        let parsed: Vec<&str> = items.iter().map(|item| item.url.as_str()).collect();
+        assert_eq!(
+            parsed,
+            vec!["https://example.com/z", "https://example.com/a"]
+        );
+
+        crate::today::sort_items(&mut items);
+
+        let sorted: Vec<&str> = items.iter().map(|item| item.url.as_str()).collect();
+        assert_eq!(
+            sorted,
+            vec!["https://example.com/z", "https://example.com/a"],
+            "发布时间、来源、标题都相同的条目必须保持解析顺序（稳定排序不应引入链接兜底键）"
+        );
+    }
+
     #[test]
     fn clean_summary_removes_html_tags() {
         let cleaned = clean_summary("<p>你好 <b>世界</b></p>");

@@ -32,15 +32,15 @@ pub fn filter_today(items: impl IntoIterator<Item = NewsItem>, range: DayRange) 
         .collect()
 }
 
-/// 按发布时间从新到旧排序；时间相同则按来源、再按标题的字典序，
-/// 最后用链接兜底，保证排序键完全相同的条目也能得到与输入顺序无关的确定性结果。
+/// 按发布时间从新到旧排序；时间相同则按来源、再按标题的字典序。
+/// `sort_by` 是稳定排序：三个排序键都相同的条目保持输入顺序，不额外引入链接兜底键
+/// （兜底键会改变相对顺序，违背规约要求的“稳定”排序）。
 pub fn sort_items(items: &mut [NewsItem]) {
     items.sort_by(|a, b| {
         b.published_at
             .cmp(&a.published_at)
             .then_with(|| a.source.cmp(&b.source))
             .then_with(|| a.title.cmp(&b.title))
-            .then_with(|| a.url.cmp(&b.url))
     });
 }
 
@@ -162,27 +162,27 @@ mod tests {
     }
 
     #[test]
-    fn identical_keys_are_ordered_independently_of_input_order() {
+    fn identical_keys_keep_input_order() {
         // 三个排序键（发布时间、来源、标题）完全一致，只有链接不同。
+        // 规约要求“稳定”排序，因此必须保持输入相对顺序，不额外引入链接兜底键。
         let time = local(2026, 11, 24, 12, 0, 0);
-        let mut forward = vec![
-            item_with_url("同名", "IT之家", time, "https://example.com/c"),
+        let mut items = vec![
+            item_with_url("同名", "IT之家", time, "https://example.com/z"),
             item_with_url("同名", "IT之家", time, "https://example.com/a"),
             item_with_url("同名", "IT之家", time, "https://example.com/b"),
         ];
-        let mut backward: Vec<NewsItem> = forward.clone();
-        backward.reverse();
 
-        sort_items(&mut forward);
-        sort_items(&mut backward);
+        sort_items(&mut items);
 
-        let urls = |items: &[NewsItem]| -> Vec<String> {
-            items.iter().map(|item| item.url.clone()).collect()
-        };
+        let urls: Vec<&str> = items.iter().map(|item| item.url.as_str()).collect();
         assert_eq!(
-            urls(&forward),
-            urls(&backward),
-            "排序键完全相同的条目必须得到与输入顺序无关的确定性输出"
+            urls,
+            vec![
+                "https://example.com/z",
+                "https://example.com/a",
+                "https://example.com/b"
+            ],
+            "三个排序键相同的条目必须保持输入相对顺序（稳定排序）"
         );
     }
 
