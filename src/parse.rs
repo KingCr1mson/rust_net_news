@@ -205,6 +205,30 @@ mod tests {
   ]
 }"#;
 
+    /// 缺标题（无 `<title>` 或只有空白）的 RSS 条目：无法展示，必须丢弃。
+    const RSS_MISSING_TITLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>缺标题测试源</title>
+    <link>https://example.com/</link>
+    <description>测试用 RSS 源</description>
+    <item>
+      <link>https://example.com/no-title</link>
+      <pubDate>Tue, 24 Nov 2026 04:58:53 GMT</pubDate>
+    </item>
+    <item>
+      <title>   </title>
+      <link>https://example.com/blank-title</link>
+      <pubDate>Tue, 24 Nov 2026 04:57:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>正常条目</title>
+      <link>https://example.com/kept</link>
+      <pubDate>Tue, 24 Nov 2026 04:56:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>"#;
+
     #[test]
     fn drops_rss_item_with_only_updated_time() {
         let items =
@@ -270,6 +294,17 @@ mod tests {
         assert!(
             matches!(err, SourceError::Parse { .. }),
             "错误类型应为 Parse：{err}"
+        );
+    }
+
+    #[test]
+    fn drops_items_missing_title() {
+        let items = parse_feed(RSS_MISSING_TITLE.as_bytes(), "缺标题测试源").expect("解析成功");
+        let urls: Vec<&str> = items.iter().map(|item| item.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://example.com/kept"],
+            "缺标题（含只有空白的标题）的条目应被丢弃，且不影响其他条目"
         );
     }
 

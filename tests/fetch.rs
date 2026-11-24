@@ -232,6 +232,39 @@ async fn fetch_all_reports_every_source_when_all_fail() {
 }
 
 #[tokio::test]
+async fn fetch_all_runs_sources_concurrently() {
+    // 两个源各延迟 300ms：串行需要 ~600ms，并发约 ~300ms。
+    // 阈值 500ms 在两侧都留了余量，用于区分并发与串行，不引入毫秒级紧断言。
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slow-a"))
+        .respond_with(rss_response(ITHOME_XML).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/slow-b"))
+        .respond_with(rss_response(HNRSS_XML).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+
+    let a = MockSource::new("IT之家", format!("{}/slow-a", server.uri()));
+    let b = MockSource::new("Hacker News", format!("{}/slow-b", server.uri()));
+    let sources: Vec<Arc<dyn NewsSource>> = vec![Arc::new(a), Arc::new(b)];
+    let client = build_client().expect("客户端创建成功");
+
+    let started = std::time::Instant::now();
+    let outcome = fetch_all(&client, &sources).await.expect("两个源都成功");
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome.items.len(), 6, "两个源共 6 条");
+    assert!(outcome.failures.is_empty(), "不应有失败源");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "两个源应并发获取（串行约 600ms），实际耗时 {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn builtin_sources_expose_expected_urls() {
     let ithome = IthomeSource;
     let hn = HackerNewsSource;
