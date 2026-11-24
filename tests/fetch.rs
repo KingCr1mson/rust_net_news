@@ -9,6 +9,7 @@ use rust_net_news::fetch::{build_client, fetch_all, fetch_source_with_timeout, F
 use rust_net_news::source::{HackerNewsSource, IthomeSource, NewsSource};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Barrier;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -233,35 +234,46 @@ async fn fetch_all_reports_every_source_when_all_fail() {
 
 #[tokio::test]
 async fn fetch_all_runs_sources_concurrently() {
-    // 两个源各延迟 300ms：串行需要 ~600ms，并发约 ~300ms。
-    // 阈值 500ms 在两侧都留了余量，用于区分并发与串行，不引入毫秒级紧断言。
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/slow-a"))
-        .respond_with(rss_response(ITHOME_XML).set_delay(Duration::from_millis(300)))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/slow-b"))
-        .respond_with(rss_response(HNRSS_XML).set_delay(Duration::from_millis(300)))
-        .mount(&server)
-        .await;
+    // 确定性重叠检测，不依赖毫秒级墙钟阈值：
+    // 两个本地服务各自收到请求后都要等 barrier 凑齐两个请求才返回。
+    // 若 fetch_all 串行执行，第一个请求永远等不到第二个，外层 5 秒超时即判定失败。
+    let barrier = Arc::new(Barrier::new(2));
+    let a_addr = spawn_barrier_server(ITHOME_XML, Arc::clone(&barrier)).await;
+    let b_addr = spawn_barrier_server(HNRSS_XML, Arc::clone(&barrier)).await;
 
-    let a = MockSource::new("IT之家", format!("{}/slow-a", server.uri()));
-    let b = MockSource::new("Hacker News", format!("{}/slow-b", server.uri()));
+    let a = MockSource::new("IT之家", format!("http://{a_addr}/feed"));
+    let b = MockSource::new("Hacker News", format!("http://{b_addr}/feed"));
     let sources: Vec<Arc<dyn NewsSource>> = vec![Arc::new(a), Arc::new(b)];
     let client = build_client().expect("客户端创建成功");
 
-    let started = std::time::Instant::now();
-    let outcome = fetch_all(&client, &sources).await.expect("两个源都成功");
-    let elapsed = started.elapsed();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), fetch_all(&client, &sources))
+        .await
+        .expect("两个源应并发获取：串行实现下第一个请求会等不到第二个请求")
+        .expect("两个源都成功");
 
     assert_eq!(outcome.items.len(), 6, "两个源共 6 条");
     assert!(outcome.failures.is_empty(), "不应有失败源");
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "两个源应并发获取（串行约 600ms），实际耗时 {elapsed:?}"
-    );
+}
+
+/// 起一个只接受一次连接、等 barrier 齐备后才返回 RSS 的本地服务。
+async fn spawn_barrier_server(body: &'static [u8], barrier: Arc<Barrier>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑定成功");
+    let addr = listener.local_addr().expect("本地地址有效");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("接受连接");
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        // 关键：两个源的请求都到达后才返回响应。
+        barrier.wait().await;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(body).await;
+        let _ = socket.flush().await;
+    });
+    addr
 }
 
 #[tokio::test]
