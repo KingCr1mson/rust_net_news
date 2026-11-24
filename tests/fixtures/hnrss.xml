@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 取自真实源 hnrss.xml 的节选，仅保留前 3 条；为解析测试补齐下面两条构造条目。 -->
+<rss version="2.0"><channel>
+<title>Hacker News: Front Page</title>
+<link>https://news.ycombinator.com/</link>
+<description>Hacker News RSS</description>
+<item>
+<title>Drone Maps of Salvage Yards</title>
+<description>
+&lt;p&gt;Article URL: &lt;a href=&quot;https://salvageyarddrone.wordpress.com/&quot;&gt;https://salvageyarddrone.wordpress.com/&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;Comments URL: &lt;a href=&quot;https://news.ycombinator.com/item?id=50623515&quot;&gt;https://news.ycombinator.com/item?id=50623515&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;Points: 17&lt;/p&gt;
+&lt;p&gt;# Comments: 5&lt;/p&gt;
+</description>
+<pubDate>Tue, 24 Nov 2026 04:00:28 +0000</pubDate>
+<link>https://salvageyarddrone.wordpress.com/</link>
+<guid>https://news.ycombinator.com/item?id=50623515</guid>
+</item>
+<item>
+<title>Show HN: Juncts, one DM inbox for five apps that Claude and ChatGPT can work in</title>
+<description>
+&lt;p&gt;Article URL: &lt;a href=&quot;https://juncts.com/app?demo=1&amp;utm_source=hackernews&amp;utm_medium=launch&amp;utm_campaign=launch-nov26&quot;&gt;https://juncts.com/app?demo=1&amp;utm_source=hackernews&amp;utm_medium=launch&amp;utm_campaign=launch-nov26&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;Comments URL: &lt;a href=&quot;https://news.ycombinator.com/item?id=50623175&quot;&gt;https://news.ycombinator.com/item?id=50623175&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;Points: 6&lt;/p&gt;
+&lt;p&gt;# Comments: 0&lt;/p&gt;
+</description>
+<pubDate>Tue, 24 Nov 2026 03:16:58 +0000</pubDate>
+<link>https://juncts.com/app?demo=1&amp;utm_source=hackernews&amp;utm_medium=launch&amp;utm_campaign=launch-nov26</link>
+<guid>https://news.ycombinator.com/item?id=50623175</guid>
+</item>
+<item>
+<title>Hacking radiators</title>
+<description>
+&lt;p&gt;Article URL: &lt;a href=&quot;https://qsantos.fr/2026/11/20/hacking-radiators-for-fun-and-no-profit/&quot;&gt;https://qsantos.fr/2026/11/20/hacking-radiators-for-fun-and-no-profit/&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;Comments URL: &lt;a href=&quot;https://news.ycombinator.com/item?id=50623020&quot;&gt;https://news.ycombinator.com/item?id=50623020&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;Points: 9&lt;/p&gt;
+&lt;p&gt;# Comments: 3&lt;/p&gt;
+</description>
+<pubDate>Tue, 24 Nov 2026 02:56:41 +0000</pubDate>
+<link>https://qsantos.fr/2026/11/20/hacking-radiators-for-fun-and-no-profit/</link>
+<guid>https://news.ycombinator.com/item?id=50623020</guid>
+</item>
+<!-- 构造条目：缺少 <link>，解析时必须被丢弃。 -->
+<item><title>构造条目：缺少链接</title><description>该条目没有链接字段。</description><pubDate>Tue, 24 Nov 2026 03:00:00 GMT</pubDate></item>
+<!-- 构造条目：缺少发布时间，解析时必须被丢弃。 -->
+<item><title>构造条目：缺少发布时间</title><link>https://example.com/no-time.htm</link><description>该条目没有发布时间字段。</description></item>
+</channel></rss>

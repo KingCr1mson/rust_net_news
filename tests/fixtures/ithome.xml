@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 取自真实源 ithome.xml 的节选，仅保留前 3 条；为解析测试补齐下面两条构造条目。 -->
+<rss version="2.0"><channel>
+<title>IT之家</title>
+<link>https://www.ithome.com/</link>
+<description>IT之家 - 软媒旗下网站</description>
+<item>
+<title>索尼微软开放《GTA 6》云游戏：PlayStation Portal 无 PS5 也可串流，需 PS Plus 三档高级订阅</title>
+<description>&lt;p data-vmark=&quot;a800&quot;&gt;IT之家 11 月 24 日消息，有玩家发现，索尼已为《侠盗猎车手 6》（GTA 6）的 PlayStation Store 页面增加云游戏串流支持标识。&lt;/p&gt;&lt;p data-vmark=&quot;64e4&quot;&gt;其中，PlayStation Portal 用户无需拥有 PS5 主机，也能直接运行这款游戏。当然，玩家需要先购买游戏才能串流。&lt;/p&gt;&lt;p data-vmark=&quot;41ed&quot;&gt;除此之外，玩家还需要订阅 PlayStation Plus 最高级别的 Premium 会员，才能使用该功能。&lt;/p&gt;&lt;p data-vmark=&quot;ddd3&quot; style=&quot;text-align: center;&quot;&gt;&lt;img src=&quot;https://img.ithome.com/newsuploadfiles/2026/11/e18c8089-4faf-43d8-9cae-4813b1950831.png?x-bce-process=image/format,f_auto&quot; w=&quot;898&quot; h=&quot;1206&quot; data-mpos=&quot;2,0&quot; data-weibo=&quot;0&quot;  data-snap-from=&quot;%7B%22from%22%3A%22x%22%2C%22url%22%3A%22https%3A%2F%2Fx.com%2FPowerUpGamingUK%2Fs</description>
+<link>https://www.ithome.com/1/031/466.htm</link>
+<guid>https://www.ithome.com/1/031/466.htm</guid>
+<pubDate>Tue, 24 Nov 2026 04:58:53 GMT</pubDate>
+</item>
+<item>
+<title>商汤发布并开源 SenseNova U1.6 原生多模态模型，能自己修正图片错误</title>
+<description>&lt;p data-vmark=&quot;d37e&quot;&gt;IT之家 11 月 24 日消息，商汤科技今日发布并开源 SenseNova U1.6 原生多模态模型，延续了 U 系列的理解与生成统一范式，&lt;strong&gt;首次为该系列的 8B 开源模型带来原生图像自修正&lt;/strong&gt;。&lt;/p&gt;&lt;p data-vmark=&quot;cb70&quot;&gt;开启自修正后，同一个模型可以先生成首稿，再对照原始提示检查画面，并根据发现的文字问题生成修正版。&lt;/p&gt;&lt;p data-vmark=&quot;14d0&quot;&gt;人像的光影、插画的笔触、海报里字体与版式的配合，也是 U1.6 这次打磨的细节。&lt;/p&gt;&lt;p data-vmark=&quot;ef12&quot; style=&quot;text-align: center;&quot;&gt;&lt;img src=&quot;https://img.ithome.com/newsuploadfiles/2026/11/589ae58a-35b1-4fac-ab72-c3598a7ffcd5.gif&quot; w=&quot;1079&quot; h=&quot;607&quot; data-s=&quot;300,640&quot; data-type=&quot;gif&quot; data-weibo=&quot;0&quot; alt=&quot;图片&quot; data-preview=&quot;https://img.ithome.com/newsuploadfiles/2026/11/589ae58a-35b1-4fac-ab72-c3598a7ffcd5.gif?</description>
+<link>https://www.ithome.com/1/031/465.htm</link>
+<guid>https://www.ithome.com/1/031/465.htm</guid>
+<pubDate>Tue, 24 Nov 2026 04:58:18 GMT</pubDate>
+</item>
+<item>
+<title>消息称豆包灰度测试“豆包购物”，配有一级功能入口</title>
+<description>&lt;p data-vmark=&quot;cdac&quot;&gt;IT之家 11 月 24 日消息，据《读佳》今日报道，豆包 App 正灰度测试“&lt;strong&gt;豆包购物&lt;/strong&gt;”，并配有一级功能入口，目前部分用户可见该功能。&lt;/p&gt;&lt;p data-vmark=&quot;7207&quot;&gt;从报道中晒出的截图可以看到，豆包购物独立放置在侧边菜单栏，和新对话、定时任务、插件技能并列，点击进入后是抖音电商提供的类小程序页面，相当于一个小型的抖音商城。&lt;/p&gt;&lt;p data-vmark=&quot;f666&quot;&gt;&lt;strong&gt;豆包购物底层复用抖音电商完整履约体系&lt;/strong&gt;，可支持实物、餐饮团购、演出票务交易，覆盖结算、退款、售后核销全链路。&lt;/p&gt;&lt;p data-vmark=&quot;362c&quot; style=&quot;text-align: center;&quot;&gt;&lt;img src=&quot;https://img.ithome.com/newsuploadfiles/2026/11/9a5d672f-df71-4807-907f-18267efc87a2.png&quot; w=&quot;861&quot; h=&quot;865&quot; data-weibo=&quot;0&quot; class=&quot;nowebp no-alt-img&quot; data-vmark=&quot;b3e3&quot;&gt;&lt;/p&gt;&lt;p data-vmark=&quot;db4d&quot;&gt;授权页面显示，这套购物链路依托抖音电商，页面标注来源为抖音电商。&lt;/p&gt;&lt;p data</description>
+<link>https://www.ithome.com/1/031/464.htm</link>
+<guid>https://www.ithome.com/1/031/464.htm</guid>
+<pubDate>Tue, 24 Nov 2026 04:36:05 GMT</pubDate>
+</item>
+<!-- 构造条目：缺少 <link>，解析时必须被丢弃。 -->
+<item><title>构造条目：缺少链接</title><description>该条目没有链接字段。</description><pubDate>Tue, 24 Nov 2026 03:00:00 GMT</pubDate></item>
+<!-- 构造条目：缺少发布时间，解析时必须被丢弃。 -->
+<item><title>构造条目：缺少发布时间</title><link>https://example.com/no-time.htm</link><description>该条目没有发布时间字段。</description></item>
+</channel></rss>
