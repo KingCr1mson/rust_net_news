@@ -1,0 +1,37 @@
+pre-commit:
+  parallel: true
+  commands:
+    block-protected-paths:
+      run: |
+        if [ "${ALLOW_PROTECTED_PATHS:-0}" = "1" ]; then
+          exit 0
+        fi
+
+        bash -o pipefail -c '
+          git diff --cached --name-only --no-renames -z -- |
+            while IFS= read -r -d "" path; do
+              case "${path##*/}" in
+                .env*|package-lock.json|npm-shrinkwrap.json|pnpm-lock.yaml|yarn.lock|bun.lock|bun.lockb|Cargo.lock|poetry.lock)
+                  printf "拦截受保护路径 %q。经人工批准后可用 ALLOW_PROTECTED_PATHS=1 提交。\n" "$path" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+        '
+    fast-checks:
+      run: |
+        if [ -f scripts/check-fast.sh ]; then
+          bash scripts/check-fast.sh
+        else
+          printf '跳过快检，项目未提供 scripts/check-fast.sh。\n'
+        fi
+
+pre-push:
+  commands:
+    full-checks:
+      run: |
+        if [ -f scripts/check-full.sh ]; then
+          bash scripts/check-full.sh
+        else
+          printf '跳过完整检查，项目未提供 scripts/check-full.sh。\n'
+        fi
