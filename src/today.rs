@@ -32,13 +32,15 @@ pub fn filter_today(items: impl IntoIterator<Item = NewsItem>, range: DayRange) 
         .collect()
 }
 
-/// 按发布时间从新到旧排序；时间相同则按来源、再按标题的字典序。
+/// 按发布时间从新到旧排序；时间相同则按来源、再按标题的字典序，
+/// 最后用链接兜底，保证排序键完全相同的条目也能得到与输入顺序无关的确定性结果。
 pub fn sort_items(items: &mut [NewsItem]) {
     items.sort_by(|a, b| {
         b.published_at
             .cmp(&a.published_at)
             .then_with(|| a.source.cmp(&b.source))
             .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.url.cmp(&b.url))
     });
 }
 
@@ -57,10 +59,24 @@ mod tests {
     }
 
     fn item(title: &str, source: &str, published_at: DateTime<FixedOffset>) -> NewsItem {
+        item_with_url(
+            title,
+            source,
+            published_at,
+            &format!("https://example.com/{title}"),
+        )
+    }
+
+    fn item_with_url(
+        title: &str,
+        source: &str,
+        published_at: DateTime<FixedOffset>,
+        url: &str,
+    ) -> NewsItem {
         NewsItem {
             title: title.to_string(),
             source: source.to_string(),
-            url: format!("https://example.com/{}", title),
+            url: url.to_string(),
             published_at,
             summary: None,
         }
@@ -143,6 +159,31 @@ mod tests {
         sort_items(&mut items);
         let titles: Vec<&str> = items.iter().map(|item| item.title.as_str()).collect();
         assert_eq!(titles, vec!["最新", "中间", "较早"]);
+    }
+
+    #[test]
+    fn identical_keys_are_ordered_independently_of_input_order() {
+        // 三个排序键（发布时间、来源、标题）完全一致，只有链接不同。
+        let time = local(2026, 11, 24, 12, 0, 0);
+        let mut forward = vec![
+            item_with_url("同名", "IT之家", time, "https://example.com/c"),
+            item_with_url("同名", "IT之家", time, "https://example.com/a"),
+            item_with_url("同名", "IT之家", time, "https://example.com/b"),
+        ];
+        let mut backward: Vec<NewsItem> = forward.clone();
+        backward.reverse();
+
+        sort_items(&mut forward);
+        sort_items(&mut backward);
+
+        let urls = |items: &[NewsItem]| -> Vec<String> {
+            items.iter().map(|item| item.url.clone()).collect()
+        };
+        assert_eq!(
+            urls(&forward),
+            urls(&backward),
+            "排序键完全相同的条目必须得到与输入顺序无关的确定性输出"
+        );
     }
 
     #[test]
