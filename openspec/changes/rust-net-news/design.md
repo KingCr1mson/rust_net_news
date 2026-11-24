@@ -54,7 +54,9 @@
 
 ### D6：错误与退出码
 
-库层用 `thiserror` 定义 `SourceError`（`Http`、`Status`、`Timeout`、`Parse`）。二进制入口用 `anyhow` 汇总。退出码规则与 spec 一致：全部源失败返回非零，部分失败返回 0 并把失败源列在标准错误。
+库层用 `thiserror` 定义 `SourceError`（`Http`、`Status`、`Timeout`、`Parse`）。二进制入口不使用 `anyhow`：`run()` 显式返回退出码（`u8`），全部源失败返回 1 并把每个源的原因写到标准错误，部分失败返回 0 并把失败源列在标准错误，参数错误由 clap 返回 2。
+
+- 备选：`main` 返回 `anyhow::Result`。拒绝原因：失败时 stderr 固定为 `Error: ...` 格式，且无法表达"部分失败仍返回 0"；错误已是类型化的 `SourceError`，附加上下文的收益不大。因此不引入 `anyhow` 依赖。
 
 ### D7：命令行用 `clap` derive，格式化集中在 `render` 模块
 
