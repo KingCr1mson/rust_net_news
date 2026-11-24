@@ -15,7 +15,7 @@
 ## 1. 项目脚手架
 
 - [x] 1.1 `cargo new --lib` 结构：在项目根创建 `Cargo.toml`（name = `rust_net_news`，edition 2021 或更新，声明 lib 与 bin），并验证 `cargo build` 通过
-- [x] 1.2 添加依赖（tokio、reqwest、feed-rs、serde、serde_json、clap、chrono、anyhow、thiserror），并验证 `cargo build` 通过；dev-dependencies 添加 wiremock 与 tokio test 支持（`clap` 使用 `4.6.9`，见验证记录中的依赖说明）
+- [x] 1.2 添加依赖（tokio、reqwest、feed-rs、serde、serde_json、clap、chrono、thiserror），并验证 `cargo build` 通过；dev-dependencies 添加 wiremock 与 tokio test 支持（`clap` 使用 `4.6.9`，见验证记录中的依赖说明）；anyhow 已按 design D6 删除，见验证记录的“依赖说明”
 - [x] 1.3 添加 `.gitignore`（忽略 `target/`），并验证 `git check-ignore target` 返回命中
 - [x] 1.4 创建 `src/lib.rs`、`src/main.rs` 与 design.md 中列出的模块空壳，并验证 `cargo build` 通过、`cargo clippy -- -D warnings` 无警告
 
