@@ -287,7 +287,33 @@ R5：任务 1.2 依赖清单删除 `anyhow` 并注明“anyhow 已按 design D6 
   立即重跑退出码 0、标准错误 0 字节、80 条（IT之家 60、Hacker News 20），字段集合
   `published_at, source, summary, title, url`，倒序检查通过。
 
+### 三次审查语义澄清（重定向）
+
+第三轮复审（HEAD `cac0927`）指出：reqwest 默认跟随 3xx 重定向，302 后接 200 会被判为成功，
+而 `news-fetching` 的“单个源失败”场景字面只写“返回非 2xx 状态码”，未说明跳转规则。
+人工已决定：**保持跟随跳转**（RSS 站点 http→https 或域名迁移是正常使用场景），并把该语义写明确。
+
+- 语义：源站返回的重定向由客户端自动跟随，成功与否以**最终响应**的状态码判定；最终响应为非 2xx 时记为失败。
+- 规约（提交 `59c7b7a`，`docs: 明确 news-fetching 的重定向语义（跟随跳转，以最终状态判定）`）：
+  “从配置的新闻源异步拉取条目”需求的描述补充跟随跳转与最终状态判定一句；`单个源失败` 场景改为
+  “超时，或跟随重定向后的最终响应为非 2xx”；新增场景“重定向后成功”。Purpose 未改（63 字）。
+- 回归用例（`tests/fetch.rs`）：
+  - `fetch_follows_redirect_to_successful_feed`：`/moved` 返回 302 → `/moved-here` 返回 200 与有效 RSS，
+    断言条目 3 条、失败列表为空。**首次运行即通过（无 RED）**：当前实现已默认跟随跳转，属预期。
+  - `fetch_redirect_to_error_is_status_failure`：`/broken` 返回 302 → `/broken-here` 返回 500，
+    断言错误为 `SourceError::Status` 且状态码为 500（不是 302）。**首次运行即通过（无 RED）**，实现本已正确。
+  - 用例有效性验证（临时把 `build_client` 加上 `redirect(Policy::none())`，验证后已 `git checkout` 恢复、未提交）：
+    两条均失败，`fetch_follows_redirect_to_successful_feed` 报
+    `AllSourcesFailed { failures: [Status { source_name: "IT之家", status: 302 }] }`，
+    `fetch_redirect_to_error_is_status_failure` 报 `left: 302, right: 500`；恢复后两条均通过。
+    即两条用例确实能捕捉“不跟随跳转”的回归，不是空断言。
+- `src/` 无改动：第二个用例未暴露缺陷，客户端策略未动。
+
 ### 未覆盖的场景与剩余风险
+
+- 重定向语义已写入规约：由 reqwest 默认策略自动跟随（最多 10 跳），以最终响应判定成功与否。
+  因此重定向链超过 10 跳、或跳到非 HTTP(S) 的 `Location` 会以 `SourceError::Http` 记为该源失败，
+  这两种情况未单独写回归用例；跨域跳转也不做额外校验（同一“源”可能最终落到别的域名）。
 
 - 未覆盖 XML 命名空间、Atom 格式的单独回归（`feed-rs` 负责解析；当前两个内置源均为 RSS 2.0）。
 - 条目时间只取 `published`（RSS 的 `pubDate`、Atom 的 `published`）；只有 `updated` / `atom:updated` 的条目按规约丢弃，

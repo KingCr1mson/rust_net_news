@@ -145,6 +145,73 @@ async fn fetch_reports_non_2xx_status() {
     }
 }
 
+/// 重定向语义：客户端默认跟随跳转，以最终响应判定成功与否。
+/// 302 指向同一源的有效 RSS 时应照常解析，不记为失败。
+#[tokio::test]
+async fn fetch_follows_redirect_to_successful_feed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/moved-here"))
+        .respond_with(rss_response(ITHOME_XML))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/moved"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/moved-here", server.uri())),
+        )
+        .mount(&server)
+        .await;
+
+    let source = MockSource::new("IT之家", format!("{}/moved", server.uri()));
+    let sources: Vec<Arc<dyn NewsSource>> = vec![Arc::new(source)];
+    let client = build_client().expect("客户端创建成功");
+
+    let outcome = fetch_all(&client, &sources)
+        .await
+        .expect("跟随重定向后应获取成功");
+
+    assert_eq!(outcome.items.len(), 3, "应解析最终响应中的条目");
+    assert!(
+        outcome.failures.is_empty(),
+        "重定向后成功不应记为失败：{:?}",
+        outcome.failures
+    );
+}
+
+/// 重定向语义：失败原因取最终响应的状态码（500），而不是重定向本身的状态码（302）。
+#[tokio::test]
+async fn fetch_redirect_to_error_is_status_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/broken-here"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/broken"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/broken-here", server.uri())),
+        )
+        .mount(&server)
+        .await;
+
+    let source = MockSource::new("Hacker News", format!("{}/broken", server.uri()));
+    let client = build_client().expect("客户端创建成功");
+    let err = fetch_source_with_timeout(&client, &source, FETCH_TIMEOUT)
+        .await
+        .expect_err("跟随重定向后遇到 500 应返回状态码错误");
+
+    match err {
+        SourceError::Status { status, .. } => {
+            assert_eq!(status, 500, "应报告最终响应的状态码，而不是重定向的 302")
+        }
+        other => panic!("错误类型应为 Status：{other}"),
+    }
+}
+
 #[tokio::test]
 async fn fetch_reports_parse_error_for_non_feed_body() {
     let server = MockServer::start().await;
