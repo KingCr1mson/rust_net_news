@@ -46,7 +46,7 @@ pub async fn fetch_source_with_timeout(
         .timeout(timeout)
         .send()
         .await
-        .map_err(|err| classify_request_error(name, &err, timeout))?;
+        .map_err(|err| classify_error(name, &err, timeout))?;
 
     let status = response.status();
     if !status.is_success() {
@@ -56,15 +56,19 @@ pub async fn fetch_source_with_timeout(
         });
     }
 
-    let body = response.bytes().await.map_err(|err| SourceError::Http {
-        source_name: name.to_string(),
-        reason: err.to_string(),
-    })?;
+    let body = response
+        .bytes()
+        .await
+        .map_err(|err| classify_error(name, &err, timeout))?;
 
     source.parse(&body)
 }
 
-fn classify_request_error(name: &str, err: &reqwest::Error, timeout: Duration) -> SourceError {
+/// 把 reqwest 错误分为超时与其它网络错误。
+///
+/// 发送请求与读取响应体都走这里：两阶段都可能碰到请求总超时，
+/// 读取响应体超时不能归为普通 HTTP 错误（否则会显示成 “error decoding response body”）。
+fn classify_error(name: &str, err: &reqwest::Error, timeout: Duration) -> SourceError {
     if err.is_timeout() {
         SourceError::Timeout {
             source_name: name.to_string(),

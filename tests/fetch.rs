@@ -1,11 +1,14 @@
 //! 用 wiremock 模拟 HTTP 的集成测试：单源获取、并发获取与失败汇总。
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rust_net_news::error::SourceError;
 use rust_net_news::fetch::{build_client, fetch_all, fetch_source_with_timeout, FETCH_TIMEOUT};
 use rust_net_news::source::{HackerNewsSource, IthomeSource, NewsSource};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -79,6 +82,45 @@ async fn fetch_reports_timeout() {
     );
     assert!(err.to_string().contains("IT之家"));
     assert!(err.to_string().contains("超时"));
+}
+
+/// 起一个只写响应头与部分响应体、随后挂起的本地服务，用于造“读响应体超时”。
+async fn spawn_stalled_body_server(hold: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑定成功");
+    let addr = listener.local_addr().expect("本地地址有效");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("接受连接");
+        // 读掉请求（本测试不关心内容）。
+        let mut request = [0u8; 2048];
+        let _ = socket.read(&mut request).await;
+        // 声明 4 KiB 响应体，但只发一小段，然后挂着不断开。
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml; charset=utf-8\r\nContent-Length: 4096\r\n\r\n<rss version=\"2.0\"><channel>",
+            )
+            .await
+            .expect("写出响应头");
+        socket.flush().await.expect("刷新 socket");
+        tokio::time::sleep(hold).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn fetch_reports_timeout_while_reading_body() {
+    let addr = spawn_stalled_body_server(Duration::from_secs(5)).await;
+    let source = MockSource::new("IT之家", format!("http://{addr}/feed"));
+    let client = build_client().expect("客户端创建成功");
+
+    let err = fetch_source_with_timeout(&client, &source, Duration::from_millis(150))
+        .await
+        .expect_err("响应体停发应超时");
+
+    assert!(
+        matches!(err, SourceError::Timeout { .. }),
+        "读响应体超时应归类为 Timeout：{err}"
+    );
+    assert!(err.to_string().contains("IT之家"), "缺少源名称：{err}");
 }
 
 #[tokio::test]
