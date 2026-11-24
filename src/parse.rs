@@ -17,7 +17,8 @@ pub fn local_offset() -> FixedOffset {
 /// 把 RSS / Atom 内容解析为统一条目。
 ///
 /// 丢弃规则：缺少标题、缺少链接、缺少发布时间的条目都会被丢弃，
-/// 且不影响同一源中其他条目。
+/// 且不影响同一源中其他条目。发布时间只取 `published`（RSS 的 `pubDate`、
+/// Atom 的 `published`），不使用 `updated` 兜底。
 pub fn parse_feed(body: &[u8], source_name: &str) -> Result<Vec<NewsItem>, SourceError> {
     let feed = feed_rs::parser::parse(body).map_err(|err| SourceError::Parse {
         source_name: source_name.to_string(),
@@ -43,9 +44,9 @@ fn convert_entry(entry: Entry, source_name: &str) -> Option<NewsItem> {
         .map(|link| link.href.trim().to_string())
         .filter(|href| !href.is_empty())?;
 
-    // Atom 条目只有 updated，RSS 条目的 updated 由 pubDate 复制而来，
-    // 因此取两者中先出现的那个；都没有时该条目无法判断是否属于当天。
-    let published = entry.published.or(entry.updated)?;
+    // 只认发布时间：`updated` / `atom:updated` 是最后修改时间，不能当作发布时间。
+    // 缺少发布时间的条目无法判断是否属于当天，必须丢弃。
+    let published = entry.published?;
 
     let summary = entry
         .summary
@@ -139,6 +140,57 @@ mod tests {
         assert!(
             !items.iter().any(|item| item.url.contains("no-time")),
             "缺发布时间的条目应被丢弃"
+        );
+    }
+
+    /// 只有 `atom:updated`、没有 `pubDate` 的 RSS 条目：无法判断发布时间，必须丢弃。
+    const RSS_ONLY_UPDATED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>只有更新时间的 RSS 源</title>
+    <link>https://example.com/</link>
+    <description>测试用 RSS 源</description>
+    <item>
+      <title>只有更新时间：RSS</title>
+      <link>https://example.com/only-updated-rss</link>
+      <atom:updated>2026-11-24T04:58:53Z</atom:updated>
+    </item>
+  </channel>
+</rss>"#;
+
+    /// 只有 `<updated>`、没有 `<published>` 的 Atom 条目：同样必须丢弃。
+    const ATOM_ONLY_UPDATED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>只有更新时间的 Atom 源</title>
+  <id>https://example.com/atom</id>
+  <updated>2026-11-24T04:58:53Z</updated>
+  <entry>
+    <title>只有更新时间：Atom</title>
+    <id>https://example.com/only-updated-atom</id>
+    <link href="https://example.com/only-updated-atom"/>
+    <updated>2026-11-24T04:58:53Z</updated>
+  </entry>
+</feed>"#;
+
+    #[test]
+    fn drops_rss_item_with_only_updated_time() {
+        let items =
+            parse_feed(RSS_ONLY_UPDATED.as_bytes(), "只有更新时间的 RSS 源").expect("解析成功");
+        assert!(
+            items.is_empty(),
+            "只有更新时间、没有发布时间的 RSS 条目必须被丢弃，实际保留：{:?}",
+            items.iter().map(|item| &item.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn drops_atom_entry_with_only_updated_time() {
+        let items =
+            parse_feed(ATOM_ONLY_UPDATED.as_bytes(), "只有更新时间的 Atom 源").expect("解析成功");
+        assert!(
+            items.is_empty(),
+            "只有更新时间、没有发布时间的 Atom 条目必须被丢弃，实际保留：{:?}",
+            items.iter().map(|item| &item.title).collect::<Vec<_>>()
         );
     }
 
