@@ -1,5 +1,7 @@
 //! 新闻源抽象与内置源。
 
+use std::sync::Arc;
+
 use crate::error::SourceError;
 use crate::model::NewsItem;
 use crate::parse::parse_feed;
@@ -22,7 +24,7 @@ pub trait NewsSource: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// 源的 RSS / Atom 地址。
-    fn url(&self) -> &'static str;
+    fn url(&self) -> &str;
 
     /// 把响应体解析为统一条目。
     fn parse(&self, body: &[u8]) -> Result<Vec<NewsItem>, SourceError> {
@@ -39,7 +41,7 @@ impl NewsSource for IthomeSource {
         ITHOME_NAME
     }
 
-    fn url(&self) -> &'static str {
+    fn url(&self) -> &str {
         ITHOME_URL
     }
 }
@@ -53,14 +55,14 @@ impl NewsSource for HackerNewsSource {
         HACKER_NEWS_NAME
     }
 
-    fn url(&self) -> &'static str {
+    fn url(&self) -> &str {
         HACKER_NEWS_URL
     }
 }
 
 /// 内置的全部新闻源。
-pub fn builtin_sources() -> Vec<Box<dyn NewsSource>> {
-    vec![Box::new(IthomeSource), Box::new(HackerNewsSource)]
+pub fn builtin_sources() -> Vec<Arc<dyn NewsSource>> {
+    vec![Arc::new(IthomeSource), Arc::new(HackerNewsSource)]
 }
 
 #[cfg(test)]
