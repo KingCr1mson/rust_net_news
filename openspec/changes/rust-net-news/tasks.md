@@ -15,7 +15,7 @@
 ## 1. 项目脚手架
 
 - [x] 1.1 `cargo new --lib` 结构：在项目根创建 `Cargo.toml`（name = `rust_net_news`，edition 2021 或更新，声明 lib 与 bin），并验证 `cargo build` 通过
-- [x] 1.2 添加依赖（tokio、reqwest、feed-rs、serde、serde_json、clap、chrono、anyhow、thiserror），并验证 `cargo build` 通过；dev-dependencies 添加 wiremock 与 tokio test 支持（`clap` 固定 `=4.6.7`，见验证记录中的依赖说明）
+- [x] 1.2 添加依赖（tokio、reqwest、feed-rs、serde、serde_json、clap、chrono、anyhow、thiserror），并验证 `cargo build` 通过；dev-dependencies 添加 wiremock 与 tokio test 支持（`clap` 使用 `4.6.9`，见验证记录中的依赖说明）
 - [x] 1.3 添加 `.gitignore`（忽略 `target/`），并验证 `git check-ignore target` 返回命中
 - [x] 1.4 创建 `src/lib.rs`、`src/main.rs` 与 design.md 中列出的模块空壳，并验证 `cargo build` 通过、`cargo clippy -- -D warnings` 无警告
 
@@ -93,8 +93,11 @@
 
 ### 依赖说明（与任务书版本的差异）
 
-- `clap`：任务书建议 4.6。镜像源中 `clap 4.6.9` 依赖的 `clap_derive 4.6.9` 不存在（可用到 4.6.7），
-  因此固定为 `clap = { version = "=4.6.7", features = ["derive"] }`，`cargo build` 通过。
+- `clap`：原为 `=4.6.7`，理由是镜像缺 `clap_derive 4.6.9`。独立审查在同一镜像下验证后已解除精确锁定，
+  现为 `clap = { version = "4.6.9", features = ["derive"] }`。验证过程：
+  `curl -s https://rsproxy.cn/index/cl/ap/clap_derive` 与 `.../cl/ap/clap` 的索引均列出 `4.6.9`；
+  `cargo update -p clap` 输出 `Updating clap v4.6.7 -> v4.6.9`、`Updating clap_derive v4.6.7 -> v4.6.9`；
+  `cargo build` 与 `cargo test` 均通过（`clap_builder` 仍解析为 4.6.7，由 clap 4.6.9 的 `^4.6.7` 依赖范围决定，兼容）。
 - `reqwest 0.13.5`：0.13 已将 `rustls-tls` 特性改名为 `rustls`，实际配置为
   `default-features = false, features = ["rustls", "http2"]`。
 - `tokio 1.54.1`、`feed-rs 3.0.0`、`serde 1.0.229`、`serde_json 1.0.154`、`chrono 0.4.45`、
@@ -136,13 +139,67 @@
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets -- -D warnings`：通过，无警告。
-- `cargo test`：52 项离线测试通过（lib 37、tests/cli.rs 2、tests/fetch.rs 7、main.rs 6），3 项联网测试按 `#[ignore]` 忽略。
+- `cargo test`：59 项离线测试通过（lib 42、tests/cli.rs 2、tests/fetch.rs 9、main.rs 6），3 项联网测试按 `#[ignore]` 忽略。
 - `openspec validate rust-net-news --strict`：`Change 'rust-net-news' is valid`。
+
+### 独立审查修复（问题 A–E）
+
+审查结论为不通过（审查时 HEAD = `ce96237`）。本轮修复提交（未 push）：
+
+| 问题 | 提交 | 内容 |
+| --- | --- | --- |
+| A（阻塞） | `dd96ddb` | 缺少发布时间不再回退到 `updated`，只认 `published` |
+| B（阻塞） | `ea67fee` | JSON Feed 等非 RSS/Atom 内容记为 `SourceError::Parse` |
+| C | `633ae46` | 读取响应体超时归类为 `SourceError::Timeout` |
+| D | `919d522` | 排序增加链接兜底键，结果与输入顺序无关 |
+| D | `65108d1` | 补充缺标题丢弃与并发获取用例 |
+| E | `cd037a1` | 解除 clap 精确锁定，升级 4.6.9 |
+
+每个问题均先写失败测试（RED）再改实现（GREEN）：
+
+- 问题 A：`parse::tests::{drops_rss_item_with_only_updated_time, drops_atom_entry_with_only_updated_time}`。
+  RED：`只有更新时间、没有发布时间的 RSS 条目必须被丢弃，实际保留：["只有更新时间：RSS"]`（Atom 同）。
+  GREEN：两条均通过，两条 fixtures 仍各解析出 3 条。
+- 问题 B：`parse::tests::json_feed_is_parse_error`（最小合法 JSON Feed 1.1）。
+  RED：`JSON Feed 不是 RSS / Atom，应视为源解析失败: [NewsItem { title: "JSON Feed 条目", ... }]`。
+  GREEN：返回 `SourceError::Parse`，`Display` 含源名称与“解析失败”；IT之家与 hnrss fixtures 解析不受影响。
+- 问题 C：`fetch::tests::fetch_reports_timeout_while_reading_body`（本地 TCP 服务返回 200 与 4 KiB 声明长度的部分响应体后挂起，注入 150ms 超时）。
+  RED：`读响应体超时应归类为 Timeout：源 IT之家 请求失败：error decoding response body for url (...)`。
+  GREEN：归为 `SourceError::Timeout`。（实现：`classify_request_error` 重命名为 `classify_error`，发送与读体共用。）
+- 问题 D：
+  - `today::tests::identical_keys_are_ordered_independently_of_input_order`。RED：正反两种输入顺序得到不同输出
+    （`left: [c, a, b]` / `right: [b, a, c]`）。GREEN：增加 `url` 兜底键后两种输入顺序输出一致。
+  - `parse::tests::drops_items_missing_title`：缺 `<title>` 与只有空白标题的两个条目被丢弃，同源其他条目保留。
+    该用例补的是覆盖缺口，实现原本已正确，直接通过（无 RED 阶段）。
+  - `fetch::tests::fetch_all_runs_sources_concurrently`：两个源各延迟 300ms，总耗时 < 500ms（串行约 600ms）；
+    单跑 3 次稳定通过，全量启用时约 0.35s。
+- 问题 E：见上文“依赖说明”。`curl https://rsproxy.cn/index/cl/ap/clap_derive` 索引含 4.6.9；
+  `cargo update -p clap` → `clap v4.6.7 -> v4.6.9`、`clap_derive v4.6.7 -> v4.6.9`；`cargo build`、`cargo test` 通过。
+
+本轮验证（修复后）：
+
+- `cargo fmt --check`：通过。
+- `cargo clippy --all-targets -- -D warnings`：通过，无警告。
+- `cargo test`：59 项离线测试通过（lib 42、tests/cli.rs 2、tests/fetch.rs 9、main.rs 6），3 项联网测试忽略。
+- `cargo test -- --ignored --test-threads=1`：首次执行 2 项通过、`live_all_builtin_sources_succeed` 失败
+  （`实际失败：[Timeout { source_name: "Hacker News", timeout_secs: 10 }]`）；立即重跑 3 项全部通过（3.10s）。
+  该用例同时请求两个真实站点，hnrss.org 偶发超过 10 秒，属既有外部依赖风险，未为通过而改断言。
+- `cargo run`：退出码 0，标准错误为空，文本 399 行即 80 条（每条 4 行 + `----` 分隔），首条为当天最新。
+- `cargo run -- --json`：退出码 0，标准错误为空，合法 JSON 数组 80 条，字段集合 `published_at, source, summary, title, url`，
+  `published_at` 形如 `2026-11-24T13:28:50+08:00`，倒序检查通过，来源为 `Hacker News` 与 `IT之家`。
+- `openspec validate rust-net-news --strict`：`Change 'rust-net-news' is valid`。
+- 工作区：`Cargo.lock` 仍未提交（锁文件需人工批准），另有他人留下的未提交修改 `openspec/changes/rust-net-news/design.md`（D6），本轮未动。
 
 ### 未覆盖的场景与剩余风险
 
 - 未覆盖 XML 命名空间、Atom 格式的单独回归（`feed-rs` 负责解析；当前两个内置源均为 RSS 2.0）。
-- 条目时间取 `published`，缺失时回退到 `updated`（Atom 源常见只有 `updated`）；两者都缺失时才丢弃。
+- 条目时间只取 `published`（RSS 的 `pubDate`、Atom 的 `published`）；只有 `updated` / `atom:updated` 的条目按规约丢弃，
+  因此只提供 `updated` 的纯 Atom 源会解析出 0 条。当前两个内置源均为 RSS 2.0，不受影响；未来接入 Atom 源需确认其提供 `published`。
+- 排序在发布时间、来源、标题之外增加链接作为兜底键，保证三个既有键完全相同的条目得到与输入顺序无关的确定性输出；
+  规约只约束前三个键，兜底键不与其冲突。
+- 并发用例用“两个源各延迟 300ms、总耗时 < 500ms”区分并发与串行（串行约 600ms）。若 CI 机器极慢该断言可能误报，
+  目前余量为 190ms。
+- JSON Feed（`feed-rs` 能解析）现按非 RSS/Atom 处理，记为 `SourceError::Parse`；若将来需要支持需另立变更。
 - 摘要 HTML 标签为简单字符扫描（非标准 HTML 解析器），未处理 `&amp;` 等实体解码与 CDATA 边界情况。
 - 时区固定 UTC+8，不支持其他时区。
 - 新闻源只返回最新 N 条，当天较早的条目可能不在 feed 中。
