@@ -87,21 +87,51 @@ impl OpenCodeConfig {
         if api_key.is_empty() {
             return Err(OpenCodeError::config("OPENCODE_API_KEY 未配置或仅包含空白"));
         }
+        // 在配置阶段就验证 Key 能否构成 Bearer 头，而不是等发请求时才失败：
+        // 发送阶段失败会走“AI 失败 → 回退列表 → 退出 0”，用户拿不到“配置错了”的信号。
+        // 这里也不把 Key 本身写进错误文本。
+        if reqwest::header::HeaderValue::from_str(api_key).is_err() {
+            return Err(OpenCodeError::config(
+                "OPENCODE_API_KEY 含无法用于认证头的字符（如控制字符或换行）",
+            ));
+        }
 
         let model = model.trim();
         if model.is_empty() {
             return Err(OpenCodeError::config("OPENCODE_MODEL 未配置或仅包含空白"));
         }
 
-        // 空白 Base URL 视为“未配置”，与用户只设置空变量时的直觉一致。
-        let raw_base_url = base_url.map(str::trim).filter(|raw| !raw.is_empty());
-        let base_url = raw_base_url.unwrap_or(DEFAULT_BASE_URL);
-        let parsed = reqwest::Url::parse(base_url).map_err(|err| {
+        // 区分“没设置”与“设置了但为空白”：后者是配置错误，不能静默回落到默认端点，
+        // 否则用户以为请求发往自己的网关，实际却发到了公网默认地址。
+        let raw_base_url = match base_url {
+            None => DEFAULT_BASE_URL,
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(OpenCodeError::config("OPENCODE_BASE_URL 已设置但为空白"));
+                }
+                trimmed
+            }
+        };
+        let parsed = reqwest::Url::parse(raw_base_url).map_err(|err| {
             OpenCodeError::config(format!("OPENCODE_BASE_URL 不是有效地址（{err}）"))
         })?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(OpenCodeError::config(
                 "OPENCODE_BASE_URL 必须是带主机名的 HTTP(S) 地址",
+            ));
+        }
+        // 端点根后面要直接拼兼容路径，因此不能带查询串或片段：
+        // `http://host/base?x=1` + `/openai/...` 会得到 `?x=1/openai/...`，那个路径并不存在。
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(OpenCodeError::config(
+                "OPENCODE_BASE_URL 不能包含查询串（?）或片段（#）",
+            ));
+        }
+        // userinfo 会隐式带上另一套凭据，不属于预期的“端点根”。
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(OpenCodeError::config(
+                "OPENCODE_BASE_URL 不能包含用户名或密码",
             ));
         }
 
@@ -129,7 +159,7 @@ impl OpenCodeConfig {
     pub fn from_env() -> Result<Self, OpenCodeError> {
         let api_key = std::env::var("OPENCODE_API_KEY").unwrap_or_default();
         let model = std::env::var("OPENCODE_MODEL").unwrap_or_default();
-        let base_url = std::env::var("OPENCODE_BASE_URL").ok();
+        let base_url = base_url_from_env(std::env::var_os("OPENCODE_BASE_URL"))?;
         Self::new(&api_key, &model, base_url.as_deref())
     }
 
@@ -141,6 +171,21 @@ impl OpenCodeConfig {
     /// 完整的 Chat Completions 请求地址（Base URL + 兼容路径）。
     pub fn endpoint(&self) -> &reqwest::Url {
         &self.endpoint
+    }
+}
+
+/// 把 `OPENCODE_BASE_URL` 的原始环境值转成 `Option<String>`。
+///
+/// 为什么不用 `std::env::var(..).ok()`：那样「变量未设置」与「变量值不是合法 UTF-8」
+/// 会合并成同一个 `None`，后者会被静默当成默认端点 —— 用户设置了地址，请求却发到
+/// 别处，属于必须在配置阶段暴露的错误。
+fn base_url_from_env(raw: Option<std::ffi::OsString>) -> Result<Option<String>, OpenCodeError> {
+    match raw {
+        None => Ok(None),
+        Some(value) => value
+            .into_string()
+            .map(Some)
+            .map_err(|_| OpenCodeError::config("OPENCODE_BASE_URL 不是有效的 Unicode 文本")),
     }
 }
 
@@ -295,17 +340,25 @@ pub async fn request_brief_with_timeout(
         .map_err(|err| classify_transport_error(&err, timeout))?;
     let parsed: ChatResponse =
         serde_json::from_slice(&bytes).map_err(|err| OpenCodeError::Protocol {
-            reason: format!("响应不是合法的 Chat Completions JSON（{err}）"),
+            // 只用行列号和受控分类：serde 的 Display 会把上游的非法字段值原样带出来。
+            reason: format!(
+                "响应不是合法的 Chat Completions JSON（{}）",
+                describe_json_error(&err)
+            ),
         })?;
 
-    // 规范只取首个 choice；`into_iter().next()` 表示“可能没有 choice”，
-    // 空数组会走到 `ok_or_else` 而不会 panic。
-    let choice = parsed
+    // 规范只取首个 choice。下面只对首个元素做严格解析，因此后面那些畸形的 choice
+    // 不会把一份本来可用的响应拖成协议错误。
+    let first = parsed
         .choices
         .into_iter()
         .next()
         .ok_or_else(|| OpenCodeError::Protocol {
             reason: "响应没有 choices".to_string(),
+        })?;
+    let choice: ChatChoice =
+        serde_json::from_value(first).map_err(|_| OpenCodeError::Protocol {
+            reason: "首个 choice 的结构不符合 Chat Completions 协议".to_string(),
         })?;
     choice
         .message
@@ -315,17 +368,40 @@ pub async fn request_brief_with_timeout(
         })
 }
 
+/// 把 `serde_json` 的错误压缩成“受控分类 + 行列号”。
+///
+/// 为什么不直接用 `err.to_string()`：serde 的类型错误会写成
+/// `invalid type: string "<上游内容>", expected a sequence`，那属于不可信内容，
+/// 不应被写到终端；对排查而言，分类 + 行列号才是我们真正需要的信息。
+fn describe_json_error(err: &serde_json::Error) -> String {
+    let category = match err.classify() {
+        serde_json::error::Category::Io => "读取失败",
+        serde_json::error::Category::Syntax => "JSON 语法错误",
+        serde_json::error::Category::Data => "字段类型或结构不符",
+        serde_json::error::Category::Eof => "内容提前结束",
+    };
+    format!("{category}，第 {} 行第 {} 列", err.line(), err.column())
+}
+
 /// 把 reqwest 错误分成超时与其它网络错误。
 ///
-/// 只取逻辑分类，不拼接请求细节：`reqwest::Error` 的 Display 不含认证头与请求体。
+/// 只保留受控的事故分类，不拼接 `reqwest::Error` 的 Display：它会把完整请求 URL（甚至
+/// 部分上游内容）写进错误文本，而我们会把错误文本直接写到终端。
 fn classify_transport_error(err: &reqwest::Error, timeout: Duration) -> OpenCodeError {
     if err.is_timeout() {
         OpenCodeError::Timeout {
             timeout_millis: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
         }
     } else {
+        let reason = if err.is_connect() {
+            "无法建立连接（网络不可达、DNS 失败或连接被拒绘）"
+        } else if err.is_body() || err.is_decode() {
+            "读取响应体失败"
+        } else {
+            "请求发送失败"
+        };
         OpenCodeError::Http {
-            reason: err.to_string(),
+            reason: reason.to_string(),
         }
     }
 }
@@ -350,9 +426,12 @@ struct ChatRequestMessage<'a> {
 }
 
 /// Chat Completions 响应体：只声明用得到的字段，其余字段由 serde 忽略。
+///
+/// `choices` 先按 JSON 值收下，而不是直接反序列化成 `Vec<ChatChoice>`：
+/// 否则第二个 choice 畸形就会让整份响应解析失败，违背“只使用首个 choice”的规约。
 #[derive(serde::Deserialize)]
 struct ChatResponse {
-    choices: Vec<ChatChoice>,
+    choices: Vec<serde_json::Value>,
 }
 
 /// 响应中的一个 choice。
@@ -372,7 +451,7 @@ struct ChatResponseMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenCodeConfig, OpenCodeError, DEFAULT_BASE_URL};
+    use super::{base_url_from_env, OpenCodeConfig, OpenCodeError, DEFAULT_BASE_URL};
 
     const TEST_KEY: &str = "oc_sk_secret_for_test";
 
@@ -457,6 +536,149 @@ mod tests {
                     assert!(
                         message.contains("OPENCODE_BASE_URL"),
                         "错误应指明字段：{message}"
+                    );
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// 合法的路径前缀必须保留：`<base-url>/openai/v1/chat/completions` 里的 Base URL
+    /// 允许自带路径（例如内网网关 `https://gateway.example.com/opencode`）。
+    #[test]
+    fn accepts_base_url_with_path_prefix() {
+        let config =
+            OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some("http://127.0.0.1:8080/gateway/"))
+                .expect("带路径前缀的地址有效");
+        assert_eq!(
+            config.endpoint().as_str(),
+            "http://127.0.0.1:8080/gateway/openai/v1/chat/completions",
+            "路径前缀必须保留，只追加兼容路径"
+        );
+    }
+
+    /// 「显式设成空白」与「根本没有设置」是两件事：前者是配置错误，不能静默回落到默认端点，
+    /// 否则用户以为请求发往自己的网关，实际却发到了公网默认地址。
+    #[test]
+    fn rejects_explicitly_blank_base_url() {
+        for blank in ["", "   ", "\t"] {
+            let err = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some(blank))
+                .expect_err("显式空白 Base URL 应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_BASE_URL"),
+                        "错误应指明字段：{message}"
+                    );
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// 带查询串或片段的地址无法作为端点根：字符串拼接会得到
+    /// `http://host/base?x=1/openai/v1/chat/completions`，路径其实不存在。
+    #[test]
+    fn rejects_base_url_with_query_or_fragment() {
+        for raw in [
+            "http://127.0.0.1:8080/gateway?token=abc",
+            "http://127.0.0.1:8080/gateway#section",
+        ] {
+            let err = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some(raw))
+                .expect_err("带查询串或片段的地址应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_BASE_URL"),
+                        "错误应指明字段：{message}"
+                    );
+                    assert!(!message.contains(raw), "错误不得回显原值：{message}");
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// userinfo（`user:pass@`）会隐式带上另一套凭据，也不属于预期的端点根。
+    #[test]
+    fn rejects_base_url_with_userinfo() {
+        for raw in [
+            "http://user:pass@127.0.0.1:8080",
+            "http://user@127.0.0.1:8080",
+        ] {
+            let err = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some(raw))
+                .expect_err("带 userinfo 的地址应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_BASE_URL"),
+                        "错误应指明字段：{message}"
+                    );
+                    assert!(
+                        !message.contains("user:pass"),
+                        "错误不得回显凭据：{message}"
+                    );
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// 环境变量的值可能不是合法 UTF-8。这种情况必须报成配置错误，不能被当成
+    /// 「没有设置」而静默使用默认端点。
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_unicode_base_url() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = std::ffi::OsString::from_vec(b"http://127.0.0.1:8080/\xFF".to_vec());
+        let err = base_url_from_env(Some(raw)).expect_err("非 Unicode 的 Base URL 应被拒绝");
+        assert!(
+            matches!(err, OpenCodeError::Config { .. }),
+            "错误类型应为 Config：{err}"
+        );
+        assert!(
+            err.to_string().contains("OPENCODE_BASE_URL"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    /// 「变量未设置」仍然合法（使用默认端点），且未设置与空值必须区分开。
+    #[test]
+    fn missing_base_url_env_falls_back_to_default() {
+        assert!(base_url_from_env(None).expect("未设置是合法的").is_none());
+        assert_eq!(
+            base_url_from_env(Some("http://127.0.0.1:8080".into())).expect("合法 UTF-8"),
+            Some("http://127.0.0.1:8080".to_string())
+        );
+    }
+
+    /// Bearer 头的值必须在配置阶段就能构造出来：否则无效 Key（控制字符、换行）
+    /// 会一直走到发送请求时才失败，降级成“AI 失败 + 回退列表”，退出码变成 0。
+    /// 另外错误文本不得包含这个非法值本身。
+    #[test]
+    fn rejects_api_key_that_cannot_be_used_as_bearer_header() {
+        for key in [
+            "oc_sk_secret_for_test\r\nX-Injected: 1",
+            "oc_sk_secret_for_test\nX-Injected: 1",
+            "oc_sk_secret_for_test\u{0}",
+            "oc_sk_secret_for_test\u{7f}",
+        ] {
+            let err = OpenCodeConfig::new(key, "kimi-k3", None)
+                .expect_err("无法构成认证头的 Key 应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_API_KEY"),
+                        "错误应指明字段：{message}"
+                    );
+                    assert!(
+                        !message.contains("oc_sk_secret_for_test"),
+                        "错误不得回显 Key 值：{message}"
+                    );
+                    assert!(
+                        !message.contains("X-Injected"),
+                        "错误不得回显注入内容：{message}"
                     );
                 }
                 other => panic!("错误类型应为 Config：{other}"),

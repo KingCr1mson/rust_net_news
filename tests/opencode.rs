@@ -279,6 +279,126 @@ async fn http_error_does_not_leak_api_key() {
     assert!(text.contains("401"), "错误文本应保留状态码：{text}");
 }
 
+/// Base URL 自带路径前缀时，兼容路径必须追加在前缀之后，而不是替换掉它。
+#[tokio::test]
+async fn sends_request_under_path_prefix_base_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/gateway/openai/v1/chat/completions"))
+        .respond_with(json_response(chat_completion_body(&serde_json::json!(
+            "{}"
+        ))))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/gateway", server.uri());
+    let config = OpenCodeConfig::new(TEST_KEY, TEST_MODEL, Some(base.as_str())).expect("配置有效");
+    let client = build_ai_client().expect("客户端创建成功");
+    request_brief(&client, &config, SYSTEM_PROMPT, USER_PROMPT)
+        .await
+        .expect("带路径前缀的请求应成功");
+
+    let request = single_request(&server).await;
+    assert_eq!(request.url.path(), "/gateway/openai/v1/chat/completions");
+}
+
+/// 规约只使用首个 choice，因此它合法时，后面那些畸形 choice 不能把整份响应拖成协议错误。
+#[tokio::test]
+async fn first_valid_choice_wins_over_malformed_later_choices() {
+    // 第一类：第二个 choice 的 content 是数字；第二类：第二个 choice 根本不是对象。
+    let second_choices = [
+        serde_json::json!({ "index": 1, "message": { "role": "assistant", "content": 42 } }),
+        serde_json::json!("not a choice object"),
+    ];
+    for second in second_choices {
+        let server = MockServer::start().await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "choices": [
+                { "index": 0, "message": { "role": "assistant", "content": "{\"overview\":\"概览\"}" } },
+                second
+            ]
+        }))
+        .expect("响应可序列化");
+        Mock::given(method("POST"))
+            .respond_with(json_response(body))
+            .mount(&server)
+            .await;
+
+        let client = build_ai_client().expect("客户端创建成功");
+        let text = request_brief(&client, &config_for(&server), SYSTEM_PROMPT, USER_PROMPT)
+            .await
+            .expect("首个 choice 合法时不应因为后续 choice 失败");
+        assert_eq!(text, r#"{"overview":"概览"}"#);
+    }
+}
+
+/// 畸形 JSON 的错误文本只允许包含行/列与受控分类，不能把上游响应体里的内容（包括它可能
+/// 回显的 Key）带到标准错误。
+#[tokio::test]
+async fn malformed_json_error_does_not_echo_upstream_content() {
+    let bodies = [
+        // 截断的 JSON，里面嵌了虚构 Key。
+        format!(r#"{{"choices":[{{"message":{{"content":"{TEST_KEY}"}}}}]"#),
+        // 类型不符：serde 的 Display 会把 "oc_sk_..." 原样写进错误文本。
+        format!(r#"{{"choices": "{TEST_KEY}"}}"#),
+    ];
+    for body in bodies {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(json_response(body.into_bytes()))
+            .mount(&server)
+            .await;
+
+        let client = build_ai_client().expect("客户端创建成功");
+        let err = request_brief(&client, &config_for(&server), SYSTEM_PROMPT, USER_PROMPT)
+            .await
+            .expect_err("畸形 JSON 应失败");
+
+        assert!(
+            matches!(err, OpenCodeError::Protocol { .. }),
+            "错误类型应为 Protocol：{err}"
+        );
+        let text = err.to_string();
+        assert!(!text.contains(TEST_KEY), "错误文本不得回显上游内容：{text}");
+        assert!(text.contains("行"), "错误文本应保留行列信息：{text}");
+    }
+}
+
+/// 传输错误的文本不得包含请求 URL：错误会直接写到终端，URL 里可能含有内网主机名或
+/// 网关凭据信息；只能用受控的中文分类描述发生了什么。
+#[tokio::test]
+async fn transport_error_does_not_echo_request_url() {
+    // 127.0.0.1:1 上几乎不会有服务监听，连接会被拒绝，不会真的发出请求。
+    let config = OpenCodeConfig::new(TEST_KEY, TEST_MODEL, Some("http://127.0.0.1:1/mock-base"))
+        .expect("配置有效");
+    let client = build_ai_client().expect("客户端创建成功");
+    let err = request_brief_with_timeout(
+        &client,
+        &config,
+        SYSTEM_PROMPT,
+        USER_PROMPT,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect_err("连接被拒绝应失败");
+
+    assert!(
+        matches!(err, OpenCodeError::Http { .. }),
+        "错误类型应为 Http：{err}"
+    );
+    let text = err.to_string();
+    assert!(
+        !text.contains("127.0.0.1"),
+        "错误文本不得回显请求 URL：{text}"
+    );
+    assert!(
+        !text.contains("chat/completions"),
+        "错误文本不得回显请求路径：{text}"
+    );
+    assert!(!text.contains(TEST_KEY), "错误文本不得包含 API Key：{text}");
+    assert!(text.contains("连接"), "应给出受控的中文原因：{text}");
+}
+
 /// 一次性请求的额外保障：客户端不跟随重定向，302 直接按非 2xx 处理，
 /// 否则可能产生第二次请求（以及第二次费用）。
 #[tokio::test]

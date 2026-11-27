@@ -105,7 +105,16 @@ impl BriefInput {
         };
 
         serde_json::to_string(&payload).map_err(|err| BriefError::Prompt {
-            reason: err.to_string(),
+            // 不拼接 serde 的 Display：序列化错误也可能带上字段值与类型细节。
+            reason: format!(
+                "提示词序列化失败（{}）",
+                match err.classify() {
+                    serde_json::error::Category::Io => "写入失败",
+                    serde_json::error::Category::Syntax => "JSON 语法错误",
+                    serde_json::error::Category::Data => "字段类型或结构不符",
+                    serde_json::error::Category::Eof => "内容提前结束",
+                }
+            ),
         })
     }
 }
@@ -209,8 +218,13 @@ impl BriefInput {
     /// 任何一处不合法都让整份结果失效（`Err`），而不是丢掉单个重点：
     /// 半份简报会被读者误以为完整，比明确的回退更糟。
     pub fn parse_response(&self, content: &str) -> Result<Brief, BriefError> {
-        let raw: RawBrief = serde_json::from_str(content)
-            .map_err(|err| BriefError::invalid(format!("不是合法的简报 JSON（{err}）")))?;
+        let raw: RawBrief = serde_json::from_str(content).map_err(|err| {
+            // 只用行列号与受控分类：serde 的类型错误会把模型给的非法字段值原样回显。
+            BriefError::invalid(format!(
+                "不是合法的简报 JSON（{}）",
+                describe_json_error(&err)
+            ))
+        })?;
 
         // serde 只保证“字段存在且类型正确”，语义约束必须逐项检查。
         let overview = raw.overview.trim();
@@ -330,6 +344,20 @@ impl BriefError {
             reason: reason.into(),
         }
     }
+}
+
+/// 把 `serde_json` 的错误压缩成“受控分类 + 行列号”。
+///
+/// 不用 `err.to_string()`：serde 会写成 `invalid type: string "<上游内容>"`，
+/// 而那串内容来自模型或中间代理，属于不可信输入，不应进终端。
+fn describe_json_error(err: &serde_json::Error) -> String {
+    let category = match err.classify() {
+        serde_json::error::Category::Io => "读取失败",
+        serde_json::error::Category::Syntax => "JSON 语法错误",
+        serde_json::error::Category::Data => "字段类型或结构不符",
+        serde_json::error::Category::Eof => "内容提前结束",
+    };
+    format!("{category}，第 {} 行第 {} 列", err.line(), err.column())
 }
 
 #[cfg(test)]
@@ -656,6 +684,27 @@ mod tests {
                 input.parse_response(content).is_err(),
                 "非 JSON 或缺少必填字段应无效：{content}"
             );
+        }
+    }
+
+    /// 解析失败的错误文本只允许包含行/列与受控分类：serde 默认的 Display 会把
+    /// “非预期的字段值”原样写进去，而那是上游（模型或中间代理）给出的不可信内容。
+    #[test]
+    fn invalid_json_error_does_not_echo_upstream_content() {
+        let input = BriefInput::new(&[item(0)]);
+        let contents = [
+            // highlights 应该是数组，这里故意给字符串：类型错误的 Display 会回显它。
+            format!(r#"{{"overview": "{TEST_KEY}", "highlights": "{TEST_KEY}"}}"#),
+            // 截断的 JSON，里面嵌了虚构 Key。
+            format!(r#"{{"overview": "{TEST_KEY}""#),
+        ];
+        for content in contents {
+            let err = input
+                .parse_response(&content)
+                .expect_err("结构不符应无效；如果没报错，说明本次回归已失效");
+            let text = err.to_string();
+            assert!(!text.contains(TEST_KEY), "错误文本不得回显上游内容：{text}");
+            assert!(text.contains("行"), "错误文本应保留行列信息：{text}");
         }
     }
 }
