@@ -256,10 +256,10 @@ async fn run_brief_with_timeout(
     }
 }
 
-/// 一次 AI 简报尝试：构建提示词 → 请求 → 校验结构。
+/// 一次 AI 简报尝试：构建提示词 → 请求 → 校验结构 → 复核敏感值。
 ///
-/// 三种失败（提示词、传输、校验）对调用方是同一件事，所以统一收敛成 `String` 原因，
-/// 而不是让 `main` 去区分 `BriefError` / `OpenCodeError`。
+/// 四类失败（提示词、传输、校验、凭据回显）对调用方是同一件事，所以统一收敛成
+/// `String` 原因，而不是让 `main` 去区分 `BriefError` / `OpenCodeError`。
 async fn generate_brief(
     config: &OpenCodeConfig,
     input: &BriefInput,
@@ -277,9 +277,19 @@ async fn generate_brief(
         .await
         .map_err(|error| error.to_string())?;
 
-    input
+    let brief = input
         .parse_response(&content)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    // 凭据复核放在“解析之后、渲染之前”，且只看**已解码**的模型文本：
+    // JSON 里写成 `\u006f\u0063...` 的转义到这里已是真实字符，直接扫原始响应串会漏掉；
+    // 同时只检查将要写进终端的概览与重点文字，不干扰正常的中文分段输出。
+    // 命中即整份作废（回退完整原始列表），错误文本不包含 Key 或模型原文。
+    if brief.texts().any(|text| config.mentions_api_key(text)) {
+        return Err("模型输出回显了 OpenCode API Key".to_string());
+    }
+
+    Ok(brief)
 }
 
 #[cfg(test)]
@@ -809,6 +819,121 @@ mod tests {
             stderr.contains("简报"),
             "标准错误应说明是简报写出失败：{stderr}"
         );
+    }
+
+    /// 把虚构 Key 逐字符写成 JSON `\u` 转义：原始响应里看不到明文 Key，
+    /// 只有解码之后的文本才会还原出它。
+    fn json_escaped(text: &str) -> String {
+        text.chars()
+            .map(|ch| format!("\\u{:04x}", ch as u32))
+            .collect()
+    }
+
+    /// 200 + 结构合法，但概览或重点文字回显了 API Key（含转义写法）时必须整份作废：
+    /// 只有对**解码后**的文本复核才能发现转义，且错误与输出都不许出现 Key。
+    #[tokio::test]
+    async fn brief_api_key_echo_falls_back() {
+        let contents = [
+            // 明文回显。
+            format!(
+                r#"{{"overview": "概览 {TEST_KEY}", "highlights": [{{"title": "重点", "summary": "说明", "source_ids": [1]}}]}}"#
+            ),
+            // JSON 转义回显：扫原始响应串会漏掉。
+            format!(
+                r#"{{"overview": "概览 {}", "highlights": [{{"title": "重点", "summary": "说明", "source_ids": [1]}}]}}"#,
+                json_escaped(TEST_KEY)
+            ),
+            // 重点摘要里回显。
+            format!(
+                r#"{{"overview": "概览", "highlights": [{{"title": "重点", "summary": "{}", "source_ids": [1]}}]}}"#,
+                json_escaped(TEST_KEY)
+            ),
+        ];
+
+        for content in contents {
+            let news = MockServer::start().await;
+            let sources = single_news_source(&news, ITHOME_XML).await;
+            let ai = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(chat_completion_response(&content))
+                .mount(&ai)
+                .await;
+
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+            assert_eq!(code, 0, "回退成功应以 0 退出");
+            let stderr = String::from_utf8(err).expect("UTF-8");
+            let stdout = String::from_utf8(out).expect("UTF-8");
+            assert!(
+                stderr.contains("AI 简报生成失败") && stderr.contains("回退为原始新闻列表"),
+                "应走回退路径：{stderr}"
+            );
+            assert!(
+                !stderr.contains(TEST_KEY) && !stdout.contains(TEST_KEY),
+                "输出不得包含 API Key：{stderr} / {stdout}"
+            );
+            assert!(
+                !stdout.contains("AI 简报"),
+                "回显凭据的响应不得被当作简报输出：{stdout}"
+            );
+            assert!(
+                stdout.contains("https://www.ithome.com/1/031/466.htm"),
+                "回退应输出完整原始列表：{stdout}"
+            );
+            assert_eq!(ai_request_count(&ai).await, 1, "一次 brief 只请求一次");
+        }
+    }
+
+    /// 非对象结构（位置数组、重复字段）或带有终端控制、伪造来源标签、自造链接的模型文本，
+    /// 都必须使整份简报失效并回退到完整原始列表。
+    #[tokio::test]
+    async fn brief_invalid_shape_or_unsafe_text_falls_back() {
+        let contents = [
+            // 顶层是位置数组：没有字段名。
+            r#"["概览", [["重点", "说明", [1]]]]"#,
+            // 重点是位置数组。
+            r#"{"overview": "概览", "highlights": [["重点", "说明", [1]]]}"#,
+            // 重复的必填字段。
+            r#"{"overview": "甲", "overview": "乙", "highlights": [{"title": "重点", "summary": "说明", "source_ids": [1]}]}"#,
+            // 伪造来源行（带换行）。
+            r#"{"overview": "概览", "highlights": [{"title": "重点\n来源：伪造来源", "summary": "说明", "source_ids": [1]}]}"#,
+            // 模型自造链接。
+            r#"{"overview": "概览", "highlights": [{"title": "重点", "summary": "详见 https://evil.invalid/x", "source_ids": [1]}]}"#,
+        ];
+
+        for content in contents {
+            let news = MockServer::start().await;
+            let sources = single_news_source(&news, ITHOME_XML).await;
+            let ai = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(chat_completion_response(content))
+                .mount(&ai)
+                .await;
+
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+            assert_eq!(code, 0, "回退成功应以 0 退出");
+            let stderr = String::from_utf8(err).expect("UTF-8");
+            let stdout = String::from_utf8(out).expect("UTF-8");
+            assert!(
+                stderr.contains("AI 简报生成失败") && stderr.contains("回退为原始新闻列表"),
+                "应走回退路径：{stderr}"
+            );
+            assert!(!stdout.contains("AI 简报"), "无效简报不得被输出：{stdout}");
+            assert!(
+                !stdout.contains("evil.invalid") && !stdout.contains("伪造来源"),
+                "模型文本不得进入终端：{stdout}"
+            );
+            assert!(
+                stdout.contains("https://www.ithome.com/1/031/466.htm"),
+                "回退应输出完整原始列表：{stdout}"
+            );
+            assert_eq!(ai_request_count(&ai).await, 1, "一次 brief 只请求一次");
+        }
     }
 
     /// 无论是 HTTP 错误体、畸形的 2xx JSON 还是畸形的简报内容，标准错误与标准输出都

@@ -124,18 +124,37 @@ fn brief_missing_model_exits_two_before_network() {
 
 #[test]
 fn brief_invalid_base_url_exits_two_before_network() {
-    let output = isolated()
-        .env("OPENCODE_API_KEY", "oc_sk_secret_for_test")
-        .env("OPENCODE_MODEL", "kimi-k3")
-        .env("OPENCODE_BASE_URL", "not a url")
-        .arg("brief")
-        .output()
-        .expect("启动成功");
-    assert_eq!(output.status.code(), Some(2), "非法 Base URL 应以 2 退出");
-    assert!(output.stdout.is_empty(), "配置错误时标准输出应为空");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("OPENCODE_BASE_URL"),
-        "标准错误应指明出错的变量：{stderr}"
-    );
+    // 除“不是地址”外，重点覆盖复审指出的形态：`https:example.invalid` 会被
+    // `Url::parse` 规范化成 `https://example.invalid/`，必须在解析前拒绝。
+    // `example.invalid` 是保留的无效域名，测试不会真的请求它。
+    for base in [
+        "not a url",
+        "https:example.invalid",
+        "http:example.invalid",
+        "http:///inference",
+        "http://exa mple.invalid",
+    ] {
+        let output = isolated()
+            .env("OPENCODE_API_KEY", "oc_sk_secret_for_test")
+            .env("OPENCODE_MODEL", "kimi-k3")
+            .env("OPENCODE_BASE_URL", base)
+            .arg("brief")
+            .output()
+            .expect("启动成功");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "非法 Base URL {base:?} 应以 2 退出"
+        );
+        assert!(output.stdout.is_empty(), "配置错误时标准输出应为空");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("OPENCODE_BASE_URL"),
+            "标准错误应指明出错的变量：{stderr}"
+        );
+        assert!(
+            !stderr.contains("oc_sk_secret_for_test"),
+            "标准错误不得回显 API Key：{stderr}"
+        );
+    }
 }

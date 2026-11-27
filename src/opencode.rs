@@ -113,10 +113,42 @@ impl OpenCodeConfig {
                 trimmed
             }
         };
+        // 下面的检查必须在 `Url::parse` **之前**基于原始字符串做：解析器会把
+        // `https:example.invalid` 规范化成 `https://example.invalid/`，也会悄悄去掉
+        // 内嵌的制表符与换行，使“畸形配置”被“修好”，配置错误因此会晚到新闻抓取
+        // 之后才暴露（退出码也不再是 2）。
+        let Some(scheme_len) = http_scheme_prefix_len(raw_base_url) else {
+            return Err(OpenCodeError::config(
+                "OPENCODE_BASE_URL 必须以 http:// 或 https:// 开头",
+            ));
+        };
+        // authority 不能为空：`https:///inference` 会被解析器“猜”成 `https://inference/`，
+        // 于是用户写错的地址变成了另一个真实主机名。
+        let authority = &raw_base_url[scheme_len..];
+        if authority.is_empty() || authority.starts_with(['/', '?', '#']) {
+            return Err(OpenCodeError::config(
+                "OPENCODE_BASE_URL 缺少主机名（authority）",
+            ));
+        }
+        // 内嵌空白与控制字符一律拒绝：控制字符会让解析器分段处理，空格则会被百分号编码
+        // 成与配置不同的地址，两种都不应被“容错”接受。
+        if authority
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            return Err(OpenCodeError::config(
+                "OPENCODE_BASE_URL 不能包含空白或控制字符",
+            ));
+        }
+
         let parsed = reqwest::Url::parse(raw_base_url).map_err(|err| {
             OpenCodeError::config(format!("OPENCODE_BASE_URL 不是有效地址（{err}）"))
         })?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        // `Url` 会把 scheme 规范化为小写，但这里仍校验一次，避免后续改动绕过前缀检查；
+        // 主机名必须存在且非空，否则拼出的请求地址无法定位。
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none_or(str::is_empty)
+        {
             return Err(OpenCodeError::config(
                 "OPENCODE_BASE_URL 必须是带主机名的 HTTP(S) 地址",
             ));
@@ -172,6 +204,29 @@ impl OpenCodeConfig {
     pub fn endpoint(&self) -> &reqwest::Url {
         &self.endpoint
     }
+
+    /// 判断 `text` 是否回显了 API Key。
+    ///
+    /// 只返回布尔值：调用方需要知道“命中了”，但不应（也不需要）拿到 Key 明文，
+    /// 因此这里不提供明文访问器。空 Key 在配置阶段已被拒绝，这里仍防御性
+    /// 返回 `false`，避免出现“空串命中一切”的假阳性。
+    pub fn mentions_api_key(&self, text: &str) -> bool {
+        !self.api_key.is_empty() && text.contains(&self.api_key)
+    }
+}
+
+/// 原始地址是否以显式 `http://` 或 `https://` 开头，返回分隔符之后的字节下标。
+///
+/// 只接受“前缀就是分隔符”，而不是“任意位置出现”：`https:example.invalid` 会被
+/// `Url::parse` 自动补全成 `https://example.invalid/`，那种缺失分隔符的写法必须在
+/// 解析前拒绝。比较用字节（`eq_ignore_ascii_case`），因此大小写不敏感，也不会因为
+/// 多字节字符切到字符中间而 panic。
+fn http_scheme_prefix_len(raw: &str) -> Option<usize> {
+    ["https://", "http://"].iter().find_map(|prefix| {
+        let head = raw.as_bytes().get(..prefix.len())?;
+        head.eq_ignore_ascii_case(prefix.as_bytes())
+            .then_some(prefix.len())
+    })
 }
 
 /// 把 `OPENCODE_BASE_URL` 的原始环境值转成 `Option<String>`。
@@ -684,6 +739,100 @@ mod tests {
                 other => panic!("错误类型应为 Config：{other}"),
             }
         }
+    }
+
+    /// 必须在 `Url::parse` 之前检查原始串：解析器会把 `https:example.invalid`
+    /// 规范化成 `https://example.invalid/`，把畸形配置“修好”，配置错误因此会晚到
+    /// 新闻抓取之后才暴露（退出码也不再是 2）。
+    #[test]
+    fn rejects_base_url_without_explicit_scheme_delimiter() {
+        for raw in [
+            "https:example.invalid",
+            "http:example.invalid",
+            "https:/example.invalid",
+            "//example.invalid",
+            "example.invalid",
+        ] {
+            let err = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some(raw))
+                .expect_err("缺少显式 http(s):// 分隔符的地址应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_BASE_URL"),
+                        "错误应指明字段：{message}"
+                    );
+                    assert!(!message.contains(raw), "错误不得回显原值：{message}");
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// 内嵌空白或 ASCII 控制字符同样在解析前拒绝：`Url::parse` 会悄悄去掉 TAB/换行，
+    /// 把空格百分号编码，从而“误解析”成一个与配置不同的地址。
+    #[test]
+    fn rejects_base_url_with_embedded_whitespace_or_control() {
+        for raw in [
+            "http://exa mple.invalid",
+            "http://127.0.0.1:8080/pa\tth",
+            "http://127.0.0.1:8080/pa\nth",
+            "http://127.0.0.1:8080/pa th",
+            "http://127.0.0.1:8080/pa\u{0}th",
+        ] {
+            let err = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some(raw))
+                .expect_err("含空白或控制字符的地址应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_BASE_URL"),
+                        "错误应指明字段：{message}"
+                    );
+                    assert!(!message.contains(raw), "错误不得回显原值：{message}");
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// 地址必须有非空 authority：只有 scheme 的地址无法构成请求。
+    #[test]
+    fn rejects_base_url_without_authority() {
+        for raw in ["https://", "https:///inference", "http:///openai"] {
+            let err = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some(raw))
+                .expect_err("缺少主机名的地址应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_BASE_URL"),
+                        "错误应指明字段：{message}"
+                    );
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// scheme 大小写不敏感：`HTTP://` 是合法地址，规范化后仍是 http。
+    #[test]
+    fn accepts_uppercase_scheme() {
+        let config = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some("HTTP://127.0.0.1:8080"))
+            .expect("大写 scheme 有效");
+        assert_eq!(
+            config.endpoint().as_str(),
+            "http://127.0.0.1:8080/openai/v1/chat/completions"
+        );
+    }
+
+    /// 凭据复核只返回布尔值：调用方需要知道“命中了”，但不能因此获得 Key 明文。
+    #[test]
+    fn mentions_api_key_reports_echo_without_revealing_key() {
+        let config = OpenCodeConfig::new(TEST_KEY, "kimi-k3", None).expect("配置有效");
+        assert!(
+            config.mentions_api_key(&format!("概览 {TEST_KEY}")),
+            "应识别回显"
+        );
+        assert!(!config.mentions_api_key("概览"), "普通文本不应命中");
+        assert!(!config.mentions_api_key(""), "空文本不应命中");
     }
 
     /// 凭据保护不只检查 Debug 不含某个固定字面量：必须确认脱敏占位符存在，

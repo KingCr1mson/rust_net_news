@@ -200,6 +200,72 @@ async fn reports_timeout_with_injected_short_timeout() {
     );
 }
 
+/// 规约的 60 秒总超时必须同时覆盖**读取响应体**：若只限制“拿到响应头”，网关先回
+/// 2xx 再把 body 挂住就会无限等待。这里用手工 TCP 服务先发响应头与半截 body，
+/// 断言客户端在注入的超时处失败，且不会重连重试。
+#[tokio::test]
+async fn reports_timeout_while_reading_body_after_2xx_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 准备：本地 loopback 监听，绝不访问外网。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("本地监听成功");
+    let addr = listener.local_addr().expect("本地地址有效");
+    let config = OpenCodeConfig::new(TEST_KEY, TEST_MODEL, Some(&format!("http://{addr}")))
+        .expect("配置有效");
+    let client = build_ai_client().expect("客户端创建成功");
+
+    // 执行：客户端在独立任务里跑，下面由“服务端”手工控制响应节奏。
+    let request = tokio::spawn(async move {
+        request_brief_with_timeout(
+            &client,
+            &config,
+            SYSTEM_PROMPT,
+            USER_PROMPT,
+            Duration::from_millis(200),
+        )
+        .await
+    });
+
+    let (mut socket, _) = listener.accept().await.expect("客户端应建立连接");
+    // 先把请求读完（客户端在等响应；请求头以空行结束）。
+    let mut buffer = [0u8; 1024];
+    let mut received: Vec<u8> = Vec::new();
+    while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = socket.read(&mut buffer).await.expect("可读到请求");
+        assert!(read > 0, "客户端请求应完整发出");
+        received.extend_from_slice(&buffer[..read]);
+    }
+
+    // 只发响应头和半截 body：`content-length` 声明的剩余字节永远不来。
+    socket
+        .write_all(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"choices\":",
+        )
+        .await
+        .expect("响应头可写出");
+    socket.flush().await.expect("刷新成功");
+
+    // 断言：已收到 2xx 头，超时发生在读 body 阶段。
+    let err = request
+        .await
+        .expect("任务未被取消")
+        .expect_err("读完响应体前应超时");
+    match &err {
+        OpenCodeError::Timeout { timeout_millis } => assert_eq!(*timeout_millis, 200),
+        other => panic!("错误类型应为 Timeout：{other}"),
+    }
+
+    // 超时不得重连：再等一小段时间，不应出现第二个连接。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "body 读超时不得触发重试"
+    );
+}
+
 #[tokio::test]
 async fn reports_non_2xx_without_retry() {
     for status in [401u16, 429, 500] {

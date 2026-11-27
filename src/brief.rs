@@ -17,6 +17,9 @@
 //! - 提示词：要求模型只依据输入生成中文 JSON，不输出 Markdown 围栏。
 //! - 结构校验：概览、重点标题与摘要必须非空，重点数量受限，引用 ID 必须全部
 //!   存在于输入条目；未知引用使整份 AI 结果无效（宁可回退，也不输出无法溯源的简报）。
+//! - 展示安全：顶层与每个重点必须是 JSON 对象（拒绝位置数组与重复字段）；模型文字
+//!   只允许单行中文，不允许终端控制字符、伪造的“来源/链接”标签或自造 URL。
+//!   这些文字会直接写到终端，放过一条就等于允许模型伪造来源或改写读者看到的链接。
 //! - 渲染：模型只提供概览、重点文字和引用关系；每条重点的来源名称、原始标题与
 //!   URL 一律由本地条目补齐，因此模型无法伪造链接。
 //!
@@ -29,7 +32,7 @@
 //!
 //! 依赖方向约束：不得依赖 `reqwest`；与 `opencode` 之间只交换字符串。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::NewsItem;
 
@@ -209,6 +212,22 @@ struct BriefHighlight {
     source_ids: Vec<usize>,
 }
 
+impl Brief {
+    /// 简报中全部由模型生成的自由文本：概览，以及每个重点的标题与摘要。
+    ///
+    /// 存在的唯一目的是让调用方在**渲染之前**对已解码的文本做敏感值复核。字段私有正是
+    /// 为了不让外部绕过校验造假；但凭据复核需要读取这些文本，所以提供一个只读迭代器。
+    /// 这里返回的已经是 serde 解码后的 `&str`：JSON 里写成 `\u006f\u0063...` 的转义
+    /// 到这里已经还原成真实字符，因此复核不会漏掉转义写法。
+    pub fn texts(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.overview.as_str()).chain(
+            self.highlights
+                .iter()
+                .flat_map(|highlight| [highlight.title.as_str(), highlight.summary.as_str()]),
+        )
+    }
+}
+
 impl BriefInput {
     /// 校验模型返回的 `message.content` 并生成 [`Brief`]。
     ///
@@ -218,19 +237,25 @@ impl BriefInput {
     /// 任何一处不合法都让整份结果失效（`Err`），而不是丢掉单个重点：
     /// 半份简报会被读者误以为完整，比明确的回退更糟。
     pub fn parse_response(&self, content: &str) -> Result<Brief, BriefError> {
-        let raw: RawBrief = serde_json::from_str(content).map_err(|err| {
-            // 只用行列号与受控分类：serde 的类型错误会把模型给的非法字段值原样回显。
-            BriefError::invalid(format!(
-                "不是合法的简报 JSON（{}）",
-                describe_json_error(&err)
-            ))
-        })?;
+        // 先用 `JsonObject` 限定顶层必须是 JSON 对象：serde 派生的结构体默认也接受
+        // 位置数组（`["概览", [...]]`），那会让“没有字段名、只是顺序碰对”的
+        // 数据通过结构校验。
+        let raw = serde_json::from_str::<JsonObject<RawBrief>>(content)
+            .map(|wrapped| wrapped.0)
+            .map_err(|err| {
+                // 只用行列号与受控分类：serde 的类型错误会把模型给的非法字段值原样回显。
+                BriefError::invalid(format!(
+                    "不是合法的简报 JSON（{}）",
+                    describe_json_error(&err)
+                ))
+            })?;
 
         // serde 只保证“字段存在且类型正确”，语义约束必须逐项检查。
         let overview = raw.overview.trim();
         if overview.is_empty() {
             return Err(BriefError::invalid("overview 为空白"));
         }
+        ensure_safe_model_text(overview, "overview")?;
         if raw.highlights.is_empty() {
             return Err(BriefError::invalid("highlights 少于 1 项"));
         }
@@ -250,12 +275,14 @@ impl BriefInput {
                     "第 {position} 个重点的 title 为空白"
                 )));
             }
+            ensure_safe_model_text(title, &format!("第 {position} 个重点的 title"))?;
             let summary = raw_highlight.summary.trim();
             if summary.is_empty() {
                 return Err(BriefError::invalid(format!(
                     "第 {position} 个重点的 summary 为空白"
                 )));
             }
+            ensure_safe_model_text(summary, &format!("第 {position} 个重点的 summary"))?;
             if raw_highlight.source_ids.is_empty() {
                 return Err(BriefError::invalid(format!(
                     "第 {position} 个重点没有 source_ids"
@@ -293,7 +320,8 @@ impl BriefInput {
     /// 把简报写成中文文本。
     ///
     /// 每个重点下的来源名称、原始标题和链接都从本地条目查表取得：
-    /// 模型返回里没有 URL 字段，因此链接不可能被模型改写。
+    /// 模型返回里没有 URL 字段，且 [`BriefInput::parse_response`] 已拒绝模型自造的链接
+    /// 与伪造的来源/链接标签，因此链接只能来自本地条目。
     ///
     /// 返回 `io::Result`：写入失败（例如标准输出被关闭）由 `main.rs` 转成退出码 1。
     pub fn render(&self, brief: &Brief, out: &mut impl std::io::Write) -> std::io::Result<()> {
@@ -326,6 +354,7 @@ impl BriefInput {
 #[derive(serde::Deserialize)]
 struct RawBrief {
     overview: String,
+    #[serde(deserialize_with = "deserialize_highlight_list")]
     highlights: Vec<RawHighlight>,
 }
 
@@ -335,6 +364,91 @@ struct RawHighlight {
     title: String,
     summary: String,
     source_ids: Vec<usize>,
+}
+
+/// 只接受 JSON 对象的结构体包装器。
+///
+/// serde 派生的结构体除 `visit_map` 外还实现了 `visit_seq`，因此位置数组
+/// `["概览", [["重点", "说明", [1]]]]` 也会被当成合法简报。这里把反序列化入口限定为
+/// `deserialize_map`：数组、字符串等形态会落到 visitor 的默认实现，直接得到类型错误。
+struct JsonObject<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for JsonObject<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(JsonObjectVisitor(std::marker::PhantomData))
+    }
+}
+
+/// 只实现 `visit_map` 的 visitor；这里没有 `visit_seq`，因此数组必然报类型不符。
+struct JsonObjectVisitor<T>(std::marker::PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for JsonObjectVisitor<T> {
+    type Value = JsonObject<T>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("一个 JSON 对象")
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        // 把“键值对流”重新暴露成 `Deserializer` 交给派生实现：既限定了入口只能是对象，
+        // 又保留了 serde 对重复必填字段的报错（后者不会被静默覆盖）。
+        T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(JsonObject)
+    }
+}
+
+/// `highlights` 的每个元素同样必须是 JSON 对象，而不是位置数组。
+fn deserialize_highlight_list<'de, D>(deserializer: D) -> Result<Vec<RawHighlight>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let wrapped = Vec::<JsonObject<RawHighlight>>::deserialize(deserializer)?;
+    Ok(wrapped.into_iter().map(|wrapped| wrapped.0).collect())
+}
+
+/// 渲染时会直接写到终端的模型文字里，不允许出现的来源/链接标签形态。
+///
+/// 只拦截“标签”而不是“来源”这个词本身：正文里正常提到来源不应被误伤。
+const FORGED_LABELS: [&str; 4] = ["来源：", "来源:", "链接：", "链接:"];
+
+/// 校验一段将要写进终端的模型自由文本。
+///
+/// 为什么必须在解析阶段做：渲染把模型文字混在本地补回的来源行之间，模型若能写换行、
+/// 终端控制序列或“来源：X”就能伪造出不存在的来源；写 URL 则可能把读者引到假链接。
+/// 命中任何一条就整份作废（回退完整原始列表），不尝试“清洗后输出”篡改模型原意。
+///
+/// 错误里只有字段位置，不含文本本身：这段文字来自不可信上游，不应再被写回终端。
+fn ensure_safe_model_text(text: &str, field: &str) -> Result<(), BriefError> {
+    if text.chars().any(is_forbidden_display_char) {
+        return Err(BriefError::invalid(format!(
+            "{field} 含换行、终端控制字符或双向控制符"
+        )));
+    }
+    if text.contains("://") {
+        return Err(BriefError::invalid(format!(
+            "{field} 含模型自行给出的链接，来源链接只能由本地条目提供"
+        )));
+    }
+    if FORGED_LABELS.iter().any(|label| text.contains(label)) {
+        return Err(BriefError::invalid(format!(
+            "{field} 含伪造的来源或链接标签"
+        )));
+    }
+    Ok(())
+}
+
+/// 是否是不允许出现在单行展示文本里的字符。
+fn is_forbidden_display_char(ch: char) -> bool {
+    ch.is_control()
+        // Unicode 行/段分隔符：很多终端会按换行处理，同样能伪造出额外的“来源”行。
+        || matches!(ch, '\u{2028}' | '\u{2029}')
+        // 双向控制符：可以让终端的显示顺序与真实文本不一致。
+        || matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 impl BriefError {
@@ -685,6 +799,112 @@ mod tests {
                 "非 JSON 或缺少必填字段应无效：{content}"
             );
         }
+    }
+
+    /// 渲染会把模型文字直接写进终端，因此概览与重点文字必须是单行、无控制字符、
+    /// 无伪造来源标签、无模型自造链接；否则模型能伪造“来源”行或改写链接显示。
+    #[test]
+    fn unsafe_model_text_is_rejected() {
+        let input = BriefInput::new(&[item(0)]);
+        let contents = [
+            // ANSI 转义序列：可以让终端变色或执行其它控制动作。
+            r#"{"overview": "概览\u001b[31m", "highlights": [{"title": "重点", "summary": "说明", "source_ids": [1]}]}"#,
+            // 换行 + 伪造来源行：读者会把下面那行当成程序补回的本地来源。
+            r#"{"overview": "概览", "highlights": [{"title": "重点\n来源：伪造来源", "summary": "说明", "source_ids": [1]}]}"#,
+            // Unicode 行/段分隔符同样会被终端当成换行。
+            r#"{"overview": "概览\u2028来源：伪造来源", "highlights": [{"title": "重点", "summary": "说明", "source_ids": [1]}]}"#,
+            // 双向控制符可以让终端的显示顺序与真实文本不一致。
+            r#"{"overview": "概览\u202e", "highlights": [{"title": "重点", "summary": "说明", "source_ids": [1]}]}"#,
+            // 即使不换行，伪造的来源/链接标签也不允许出现在模型文字里。
+            r#"{"overview": "概览", "highlights": [{"title": "重点", "summary": "来源：伪造来源", "source_ids": [1]}]}"#,
+            // 模型自造链接：来源链接只能来自本地条目。
+            r#"{"overview": "概览", "highlights": [{"title": "重点", "summary": "详见 https://evil.invalid/x", "source_ids": [1]}]}"#,
+        ];
+        for content in contents {
+            let err = input
+                .parse_response(content)
+                .expect_err("不安全的模型文本应使整份简报无效");
+            assert!(
+                matches!(err, BriefError::InvalidResponse { .. }),
+                "错误类型应为 InvalidResponse：{err}"
+            );
+        }
+    }
+
+    /// 不安全文本的错误只说明“哪个字段不合格”，不回显模型给出的原文。
+    #[test]
+    fn unsafe_model_text_error_does_not_echo_content() {
+        let input = BriefInput::new(&[item(0)]);
+        let content = r#"{"overview": "概览", "highlights": [{"title": "重点", "summary": "来源：伪造来源 https://evil.invalid/x", "source_ids": [1]}]}"#;
+        let err = input.parse_response(content).expect_err("应无效");
+        let text = err.to_string();
+        assert!(
+            !text.contains("evil.invalid"),
+            "错误不得回显模型内容：{text}"
+        );
+        assert!(!text.contains("伪造"), "错误不得回显模型内容：{text}");
+        assert!(text.contains("summary"), "错误应指出字段：{text}");
+    }
+
+    /// 只拦截“标签形态”的来源/链接与 URL：正常中文标点（如全角冒号）不能被误伤。
+    #[test]
+    fn plain_chinese_text_with_colons_still_parses() {
+        let input = BriefInput::new(&[item(0)]);
+        let content = r#"{"overview": "开源模型与芯片：两类进展", "highlights": [{"title": "重点：开源", "summary": "多家来源确认", "source_ids": [1]}]}"#;
+        let brief = input.parse_response(content).expect("普通中文不应被拒绝");
+        assert_eq!(brief.texts().count(), 3, "概览 + 标题 + 摘要都应可见");
+    }
+
+    /// 位置数组（没有字段名的 JSON 数组）不是简报：serde 派生的结构体默认也接受它，
+    /// 那会让“字段顺序碰巧正确”的无效数据通过校验。
+    #[test]
+    fn positional_array_brief_is_invalid() {
+        let input = BriefInput::new(&[item(0)]);
+        let contents = [
+            // 顶层是数组。
+            r#"["概览", [["重点", "说明", [1]]]]"#,
+            // 顶层是对象，但 highlights 的元素是位置数组。
+            r#"{"overview": "概览", "highlights": [["重点", "说明", [1]]]}"#,
+        ];
+        for content in contents {
+            let err = input
+                .parse_response(content)
+                .expect_err("数组形式不是合法简报");
+            assert!(
+                matches!(err, BriefError::InvalidResponse { .. }),
+                "错误类型应为 InvalidResponse：{err}"
+            );
+        }
+    }
+
+    /// 重复的必填字段说明上游给了两份互相矛盾的值，不能被“后者覆盖前者”悄悄接受。
+    #[test]
+    fn duplicate_required_fields_are_invalid() {
+        let input = BriefInput::new(&[item(0)]);
+        let contents = [
+            r#"{"overview": "甲", "overview": "乙", "highlights": [{"title": "重点", "summary": "说明", "source_ids": [1]}]}"#,
+            r#"{"overview": "概览", "highlights": [{"title": "甲", "title": "乙", "summary": "说明", "source_ids": [1]}]}"#,
+        ];
+        for content in contents {
+            let err = input
+                .parse_response(content)
+                .expect_err("重复必填字段应无效");
+            assert!(
+                matches!(err, BriefError::InvalidResponse { .. }),
+                "错误类型应为 InvalidResponse：{err}"
+            );
+        }
+    }
+
+    /// `texts()` 暴露的是**解码后**的模型文本：JSON 里的 `\u` 转义到这里已是真实字符，
+    /// 凭据复核必须基于它，扫原始响应串会漏掉转义写法。
+    #[test]
+    fn texts_exposes_decoded_model_text() {
+        let input = BriefInput::new(&[item(0)]);
+        let content = "{\"overview\": \"\\u006f\\u0063\", \"highlights\": [{\"title\": \"重点\", \"summary\": \"说明\", \"source_ids\": [1]}]}";
+        let brief = input.parse_response(content).expect("简报有效");
+        let texts: Vec<&str> = brief.texts().collect();
+        assert_eq!(texts, vec!["oc", "重点", "说明"]);
     }
 
     /// 解析失败的错误文本只允许包含行/列与受控分类：serde 默认的 Display 会把
