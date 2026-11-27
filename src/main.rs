@@ -190,7 +190,10 @@ async fn run_brief(
 ///
 /// 1. 新闻源全部失败 → 退出 1，不调用 AI；
 /// 2. 当天没有条目 → 输出“当天没有新闻”，退出 0，不调用 AI；
-/// 3. 有条目 → 至多一次 AI 请求；成功则渲染简报，失败则回退原始列表。
+/// 3. 有条目 → 至多一次 AI 请求；成功则渲染简报，失败则回退完整原始列表并退出 0。
+///
+/// 注意第 3 条的退出码：只要回退列表写成功就是 0。判断“是否 AI 简报”只能看标准错误，
+/// 这是为了提高交互可用性而接受的权衡（详见 design D6）。
 async fn run_brief_with_timeout(
     sources: &[Arc<dyn NewsSource>],
     config: &OpenCodeConfig,
@@ -225,7 +228,7 @@ async fn run_brief_with_timeout(
     }
 
     match generate_brief(config, &input, ai_timeout).await {
-        Ok(brief) => match input.render(&brief, out) {
+        Ok(brief) => match input.render(&brief, out).and_then(|()| out.flush()) {
             Ok(()) => EXIT_OK,
             Err(error) => {
                 let _ = writeln!(err, "写出简报失败：{error}");
@@ -233,9 +236,22 @@ async fn run_brief_with_timeout(
             }
         },
         Err(reason) => {
-            // 6.2 的临时行为：先用退出码 1 暴露“AI 失败”。回退完整列表在 6.3 实现。
+            // 失败不能只报错：用户拿这份输出是为了看新闻，所以把当天新闻完整降级输出。
+            // 两行 stderr 缺一不可：前一行说 AI 的哪一步失败，后一行说 stdout 究竟是什么，
+            // 避免读者把它当成 AI 生成的简报。
             let _ = writeln!(err, "AI 简报生成失败：{reason}");
-            EXIT_FAILURE
+            let _ = writeln!(err, "回退为原始新闻列表");
+
+            // 回退用的是未截断的 `items`（不是 `input` 里的 50 条），并且只调一次文本渲染。
+            // `and_then(|()| out.flush())`：写入成功但 flush 失败的输出同样没真的落到终端，
+            // 必须归为退出码 1，而不是默默返回 0。
+            match render_text(&items, out).and_then(|()| out.flush()) {
+                Ok(()) => EXIT_OK,
+                Err(error) => {
+                    let _ = writeln!(err, "输出原始新闻列表失败：{error}");
+                    EXIT_FAILURE
+                }
+            }
         }
     }
 }
@@ -519,6 +535,357 @@ mod tests {
             "{stderr}"
         );
         assert_eq!(ai_request_count(&ai).await, 0, "全部源失败时不得请求 AI");
+    }
+
+    /// 生成 `count` 条都属于“当天”的 RSS 条目（每条相隔 1 分钟）。
+    ///
+    /// 用于验证“发送给 AI 的输入被截断到 50 条，但回退列表仍完整”这条规约。
+    fn many_items_feed(count: usize) -> Vec<u8> {
+        let base = chrono::DateTime::parse_from_rfc3339(FIXTURE_DAY)
+            .expect("时间有效")
+            .with_timezone(&chrono::Utc);
+        let mut items = String::new();
+        for index in 0..count {
+            let published = base - chrono::Duration::minutes(index as i64);
+            items.push_str(&format!(
+                "<item><title>批量条目 {index}</title><link>https://example.com/{index}</link><pubDate>{}</pubDate></item>",
+                published.format("%a, %d %b %Y %H:%M:%S GMT")
+            ));
+        }
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><rss version=\"2.0\"><channel><title>批量源</title><link>https://example.com/</link><description>测试源</description>{items}</channel></rss>"
+        )
+        .into_bytes()
+    }
+
+    /// 测试用的 writer：可以指定在 `write` 或 `flush` 阶段失败。
+    ///
+    /// 为什么两种都测：`writeln!` 当场失败与“数据还在缓冲、flush 时才发现失败”是两条
+    /// 不同的出口，而退出码必须是同一个 1。
+    struct FailingWriter {
+        fail_on: FailOn,
+    }
+
+    enum FailOn {
+        Write,
+        Flush,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if matches!(self.fail_on, FailOn::Write) {
+                // `ErrorKind::Other`（`Error::other` 的简写）模拟最常见的写出失败。
+                return Err(std::io::Error::other("写入失败（测试注入）"));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if matches!(self.fail_on, FailOn::Flush) {
+                return Err(std::io::Error::other("刷新失败（测试注入）"));
+            }
+            Ok(())
+        }
+    }
+
+    /// 把一个 RSS 响应挂到 `/ithome`，返回只含该源的源列表。
+    async fn single_news_source(news: &MockServer, body: &[u8]) -> Vec<Arc<dyn NewsSource>> {
+        mount_feed(news, "/ithome", body).await;
+        vec![MockSource::boxed(
+            "IT之家",
+            format!("{}/ithome", news.uri()),
+        )]
+    }
+
+    #[tokio::test]
+    async fn brief_ai_429_falls_back_to_original_list() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, ITHOME_XML).await;
+        let ai = MockServer::start().await;
+        mount_ai_status(&ai, 429).await;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+        // 回退是“新闻仍然可用”的表达，因此退出码为 0；但标准错误必须明确报错。
+        assert_eq!(code, 0, "AI 失败后回退成功应以 0 退出");
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(stderr.contains("AI 简报生成失败"), "缺少失败提示：{stderr}");
+        assert!(
+            stderr.contains("回退为原始新闻列表"),
+            "缺少回退提示：{stderr}"
+        );
+        assert!(stderr.contains("429"), "应保留状态码：{stderr}");
+
+        let text = String::from_utf8(out).expect("UTF-8");
+        assert!(
+            text.contains("https://www.ithome.com/1/031/466.htm"),
+            "回退列表应包含原始新闻链接：{text}"
+        );
+        assert!(!text.contains("AI 简报"), "回退列表不得伪装成简报：{text}");
+        assert_eq!(ai_request_count(&ai).await, 1, "失败后不得重试");
+    }
+
+    #[tokio::test]
+    async fn brief_ai_timeout_falls_back_without_retry() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, ITHOME_XML).await;
+        let ai = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                chat_completion_response(VALID_BRIEF).set_delay(Duration::from_millis(800)),
+            )
+            .mount(&ai)
+            .await;
+
+        // 注入 100ms 超时，避免真的等 60 秒；生产入口 run_brief 仍固定传 60 秒。
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief_with_timeout(
+            &sources,
+            &ai_config(&ai),
+            now(),
+            Duration::from_millis(100),
+            &mut out,
+            &mut err,
+        )
+        .await;
+
+        assert_eq!(code, 0, "超时后回退成功应以 0 退出");
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(stderr.contains("AI 简报生成失败"), "{stderr}");
+        assert!(stderr.contains("回退为原始新闻列表"), "{stderr}");
+        assert!(stderr.contains("超时"), "应说明是超时：{stderr}");
+        assert!(
+            String::from_utf8(out)
+                .expect("UTF-8")
+                .contains("https://www.ithome.com/1/031/466.htm"),
+            "回退列表应包含原始新闻"
+        );
+        assert_eq!(ai_request_count(&ai).await, 1, "超时不得自动重试");
+    }
+
+    #[tokio::test]
+    async fn brief_invalid_json_falls_back() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, ITHOME_XML).await;
+        let ai = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(chat_completion_response(
+                "这不是 JSON，也没有 Markdown 围栏",
+            ))
+            .mount(&ai)
+            .await;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+        assert_eq!(code, 0);
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(stderr.contains("AI 简报生成失败"), "{stderr}");
+        assert!(stderr.contains("回退为原始新闻列表"), "{stderr}");
+        assert!(String::from_utf8(out)
+            .expect("UTF-8")
+            .contains("https://www.ithome.com/1/031/466.htm"));
+    }
+
+    #[tokio::test]
+    async fn brief_unknown_source_id_falls_back() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, ITHOME_XML).await;
+        let ai = MockServer::start().await;
+        // 引用了不存在的 ID：整份简报无效（否则读者会看到无法溯源的“新闻”）。
+        let content = r#"{
+            "overview": "概览",
+            "highlights": [
+                {"title": "重点", "summary": "说明", "source_ids": [99]}
+            ]
+        }"#;
+        Mock::given(method("POST"))
+            .respond_with(chat_completion_response(content))
+            .mount(&ai)
+            .await;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+        assert_eq!(code, 0);
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(stderr.contains("AI 简报生成失败"), "{stderr}");
+        assert!(stderr.contains("回退为原始新闻列表"), "{stderr}");
+        assert!(
+            !String::from_utf8(out).expect("UTF-8").contains("AI 简报"),
+            "无效简报不得被输出"
+        );
+    }
+
+    #[tokio::test]
+    async fn brief_fallback_above_50_contains_all_items() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, &many_items_feed(51)).await;
+        let ai = MockServer::start().await;
+        mount_ai_status(&ai, 500).await;
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("UTF-8");
+        assert_eq!(
+            text.matches("链接：").count(),
+            51,
+            "回退列表必须是完整当天列表，不受 AI 输入 50 条上限影响"
+        );
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(
+            stderr.contains("仅使用最新 50 条"),
+            "超过 50 条时应在标准错误提示截断：{stderr}"
+        );
+        assert!(stderr.contains("回退为原始新闻列表"), "{stderr}");
+        assert_eq!(ai_request_count(&ai).await, 1);
+    }
+
+    #[tokio::test]
+    async fn brief_fallback_write_failure_exits_one() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, ITHOME_XML).await;
+        let ai = MockServer::start().await;
+        mount_ai_status(&ai, 500).await;
+
+        let mut out = FailingWriter {
+            fail_on: FailOn::Write,
+        };
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+        assert_eq!(code, 1, "回退列表写出失败应以 1 退出");
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(stderr.contains("回退为原始新闻列表"), "{stderr}");
+        assert!(stderr.contains("失败"), "标准错误应说明写出失败：{stderr}");
+    }
+
+    #[tokio::test]
+    async fn brief_fallback_flush_failure_exits_one() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, ITHOME_XML).await;
+        let ai = MockServer::start().await;
+        mount_ai_status(&ai, 500).await;
+
+        // 数据写进了缓冲，但 flush 失败：对用户而言输出并没有真的落到终端，必须报 1。
+        let mut out = FailingWriter {
+            fail_on: FailOn::Flush,
+        };
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+        assert_eq!(code, 1, "回退列表 flush 失败应以 1 退出");
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(stderr.contains("回退为原始新闻列表"), "{stderr}");
+    }
+
+    #[tokio::test]
+    async fn brief_flush_failure_exits_one() {
+        let news = MockServer::start().await;
+        let sources = single_news_source(&news, ITHOME_XML).await;
+        let ai = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(chat_completion_response(VALID_BRIEF))
+            .mount(&ai)
+            .await;
+
+        let mut out = FailingWriter {
+            fail_on: FailOn::Flush,
+        };
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+        assert_eq!(code, 1, "简报 flush 失败应以 1 退出");
+        let stderr = String::from_utf8(err).expect("UTF-8");
+        assert!(
+            stderr.contains("简报"),
+            "标准错误应说明是简报写出失败：{stderr}"
+        );
+    }
+
+    /// 无论是 HTTP 错误体、畸形的 2xx JSON 还是畸形的简报内容，标准错误与标准输出都
+    /// 不得包含 API Key。虚构 key 由上游“故意”回显，用来模拟最坏情况。
+    #[tokio::test]
+    async fn brief_errors_never_expose_api_key() {
+        // 情形一：401，上游把 Key 与提示词回显在响应体里。
+        // 情形二：200，但 JSON 结构不符，且非法字段值就是 Key（serde 的 Display 会回显它）。
+        // 情形三：200，content 是畸形简报 JSON，且字段值含 Key。
+        enum Reply {
+            Status,
+            MalformedJson(Vec<u8>),
+            MalformedBrief(String),
+        }
+        let replies = vec![
+            Reply::Status,
+            Reply::MalformedJson(format!(r#"{{"choices": "{TEST_KEY}"}}"#).into_bytes()),
+            Reply::MalformedBrief(format!(
+                r#"{{"overview": "{TEST_KEY}", "highlights": "{TEST_KEY}"}}"#
+            )),
+        ];
+
+        for reply in replies {
+            let news = MockServer::start().await;
+            let sources = single_news_source(&news, ITHOME_XML).await;
+            let ai = MockServer::start().await;
+            match reply {
+                Reply::Status => {
+                    Mock::given(method("POST"))
+                        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+                            "invalid token: Bearer {TEST_KEY}; prompt=批量条目"
+                        )))
+                        .mount(&ai)
+                        .await;
+                }
+                Reply::MalformedJson(body) => {
+                    Mock::given(method("POST"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .insert_header("content-type", "application/json")
+                                .set_body_bytes(body),
+                        )
+                        .mount(&ai)
+                        .await;
+                }
+                Reply::MalformedBrief(content) => {
+                    Mock::given(method("POST"))
+                        .respond_with(chat_completion_response(&content))
+                        .mount(&ai)
+                        .await;
+                }
+            }
+
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let code = run_brief(&sources, &ai_config(&ai), now(), &mut out, &mut err).await;
+
+            assert_eq!(code, 0, "回退成功应以 0 退出");
+            let stderr = String::from_utf8(err).expect("UTF-8");
+            let stdout = String::from_utf8(out).expect("UTF-8");
+            assert!(
+                stderr.contains("回退为原始新闻列表"),
+                "应走回退路径：{stderr}"
+            );
+            assert!(
+                !stderr.contains(TEST_KEY),
+                "标准错误不得包含 API Key：{stderr}"
+            );
+            assert!(
+                !stdout.contains(TEST_KEY),
+                "标准输出不得包含 API Key：{stdout}"
+            );
+            assert!(
+                !stderr.contains("Bearer"),
+                "标准错误不得包含认证头：{stderr}"
+            );
+        }
     }
 
     #[tokio::test]
