@@ -113,6 +113,16 @@ impl OpenCodeConfig {
                 trimmed
             }
         };
+        // 反斜杠必须在解析前拒绝：HTTP(S) 属于 “special scheme”，URL 解析器会把 `\`
+        // 当作分隔符 `/`，于是 `https://\example.invalid` 被规范化成
+        // `https://example.invalid/`（还能绕过下面的空 authority 检查），用户写错的
+        // 地址就变成了另一个真实主机。合法的百分号编码（如 `%5C`）并不包含字面反斜杠，
+        // 因此不受这条规则影响。
+        if raw_base_url.contains('\\') {
+            return Err(OpenCodeError::config(
+                "OPENCODE_BASE_URL 不能包含反斜杠（URL 解析器会把它当作路径分隔符）",
+            ));
+        }
         // 下面的检查必须在 `Url::parse` **之前**基于原始字符串做：解析器会把
         // `https:example.invalid` 规范化成 `https://example.invalid/`，也会悄悄去掉
         // 内嵌的制表符与换行，使“畸形配置”被“修好”，配置错误因此会晚到新闻抓取
@@ -810,6 +820,51 @@ mod tests {
                 other => panic!("错误类型应为 Config：{other}"),
             }
         }
+    }
+
+    /// 反斜杠是同一类“被解析器改写”的输入，而且能绕过“空 authority”检查：
+    /// 对 HTTP(S) 这种 special scheme，URL 解析器把 `\` 当作分隔符 `/`，于是
+    /// `https://\example.invalid` 被规范化成 `https://example.invalid/` —— 用户写错的
+    /// 地址变成了另一个真实主机，畸形配置因此进入抓取流程。
+    ///
+    /// 所以判定放在原始字符串上：只要出现反斜杠就拒绝，不依赖 authority 检查是否覆盖。
+    #[test]
+    fn rejects_base_url_with_backslash() {
+        for raw in [
+            "https://\\example.invalid",
+            "https://\\\\example.invalid",
+            "http://127.0.0.1:8080/pa\\th",
+            "https://example.invalid/inference\\",
+        ] {
+            let err = OpenCodeConfig::new(TEST_KEY, "kimi-k3", Some(raw))
+                .expect_err("含反斜杠的地址应被拒绝");
+            match err {
+                OpenCodeError::Config { message } => {
+                    assert!(
+                        message.contains("OPENCODE_BASE_URL"),
+                        "错误应指明字段：{message}"
+                    );
+                    assert!(!message.contains(raw), "错误不得回显原值：{message}");
+                }
+                other => panic!("错误类型应为 Config：{other}"),
+            }
+        }
+    }
+
+    /// 拒绝反斜杠不能顺手把合法写法一起拒掉：百分号编码的路径段（含 `%5C`）
+    /// 是纯粹的 ASCII 路径文本，解析器不会把它当成分隔符，必须继续可用。
+    #[test]
+    fn accepts_base_url_with_percent_encoded_path() {
+        let config = OpenCodeConfig::new(
+            TEST_KEY,
+            "kimi-k3",
+            Some("https://gateway.example.com/opencode%5Cv1/"),
+        )
+        .expect("含百分号编码的路径前缀有效");
+        assert_eq!(
+            config.endpoint().as_str(),
+            "https://gateway.example.com/opencode%5Cv1/openai/v1/chat/completions"
+        );
     }
 
     /// scheme 大小写不敏感：`HTTP://` 是合法地址，规范化后仍是 http。

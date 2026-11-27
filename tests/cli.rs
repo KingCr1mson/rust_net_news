@@ -126,6 +126,9 @@ fn brief_missing_model_exits_two_before_network() {
 fn brief_invalid_base_url_exits_two_before_network() {
     // 除“不是地址”外，重点覆盖复审指出的形态：`https:example.invalid` 会被
     // `Url::parse` 规范化成 `https://example.invalid/`，必须在解析前拒绝。
+    // 反斜杠同理：HTTP(S) 是 special scheme，解析器把 `\` 当成分隔符 `/`，
+    // `https://\example.invalid` 会变成 `https://example.invalid/`，且能绕过
+    // “空 authority”检查；因此必须在原始字符串上拒绝。
     // `example.invalid` 是保留的无效域名，测试不会真的请求它。
     for base in [
         "not a url",
@@ -133,6 +136,8 @@ fn brief_invalid_base_url_exits_two_before_network() {
         "http:example.invalid",
         "http:///inference",
         "http://exa mple.invalid",
+        "https://\\example.invalid",
+        "http://127.0.0.1:8080/pa\\th",
     ] {
         let output = isolated()
             .env("OPENCODE_API_KEY", "oc_sk_secret_for_test")
