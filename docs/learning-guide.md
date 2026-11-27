@@ -22,7 +22,8 @@
 10. [依赖库一览与学习网址](#10-依赖库一览与学习网址)
 11. [建议的阅读顺序与练习](#11-建议的阅读顺序与练习)
 12. [常见疑问](#12-常见疑问)
-13. [延伸阅读](#13-延伸阅读)
+13. [第二阶段：AI 简报](#13-第二阶段ai-简报)
+14. [延伸阅读](#14-延伸阅读)
 
 ---
 
@@ -59,11 +60,14 @@ rust_net_news/
 │   ├── fetch.rs        网络请求与并发
 │   ├── parse.rs        解析 RSS 内容
 │   ├── today.rs        "今天"的时间范围、过滤与排序
-│   └── render.rs       输出为文本或 JSON
+│   ├── render.rs       输出为文本或 JSON
+│   ├── opencode.rs     OpenCode 配置与一次 Chat Completions 请求（只做传输）
+│   └── brief.rs        简报输入裁剪、提示词、响应校验与本地渲染（只做领域逻辑）
 ├── tests/              集成测试（像外部用户一样调用程序）
 │   ├── fixtures/       离线测试用的真实 RSS 样例
 │   ├── fetch.rs        获取逻辑的测试（使用本地假服务器）
-│   ├── cli.rs          命令行参数的测试
+│   ├── cli.rs          命令行参数与 brief 配置错误的测试
+│   ├── opencode.rs     用 wiremock 模拟 OpenCode 的请求与失败测试
 │   └── live.rs         真实联网测试（默认不运行）
 ├── scripts/            提交前检查脚本
 ├── openspec/           需求与规约文档（项目的"设计依据"）
@@ -85,6 +89,7 @@ rust_net_news/
 cargo run              # 文本输出（默认）
 cargo run -- --json    # JSON 输出，注意 -- 之后的参数才传给程序
 cargo run -- --help    # 查看帮助
+cargo run -- brief     # 生成当天的 AI 中文简报（需要 OPENCODE_* 配置）
 ```
 
 **注意**：`cargo run -- --json` 中间的 `--` 是给 cargo 的分隔符，意思是"后面的参数交给我们自己的程序"。
@@ -127,6 +132,30 @@ bash scripts/check-fast.sh      # 格式检查 + 静态检查 + 测试，提交�
 
 这条流水线的每一步都是一个独立函数，输入输出清楚。**这是这个项目最值得学习的设计习惯**：
 把"联网""解析""过滤""输出"拆开，每一块都能单独测试。
+
+第二阶段新增的 `brief` 子命令复用前五步，只在"排序"之后分成两条出口：
+
+```
+  collect_today_items()        ← 1~5 步（与默认列表共用的 helper）
+        │
+        ├─ Vec::is_empty() → 输出“当天没有新闻”，退出 0，不调用 AI
+        │
+        ▼
+  BriefInput::new(&items)      ← 只取最新 50 条，并为每条分配稳定 ID 1..=N
+        │
+        ▼
+  build_user_prompt()          ← 生成 JSON 提示词（只有允许外发的字段）
+        │
+        ▼
+  opencode::request_brief_with_timeout()   ← 唯一一次非流式请求（1200 token / 60 秒）
+        │
+        ▼
+  BriefInput::parse_response() ← 校验结构、检查引用 ID 是否都存在
+        │
+        ├─ Ok(brief)  → render() 写出中文简报，退出 0
+        └─ Err(reason) → stderr 写“AI 简报生成失败”+“回退为原始新闻列表”，
+                         stdout 用 render_text 输出**完整**「items」，退出 0
+```
 
 ---
 
@@ -221,11 +250,41 @@ pub trait NewsSource: Send + Sync {
 - 两个函数都接收 `out: &mut impl Write`，即"任何可以写入的对象"。
   终端输出时传入标准输出，测试时传入一个 `Vec<u8>`（内存缓冲区）。这样测试就能"捕获"输出内容来比对。
 
-### 5.8 `main.rs`：程序入口
+### 5.8 `opencode.rs`：配置与传输
 
-- `Args`：用 `clap` 库定义命令行参数。目前只有 `--json` 一个。
+- `OpenCodeConfig`：三个字段来自环境变量。`api_key` 是私有字段，`Debug` 手写成 `REDACTED`，
+  所以 `println!("{config:?}")` 不会泄露凭据。
+- `OpenCodeConfig::new(...)` 返回 `Result`：所有配置问题（空 Key、空模型、非法 Base URL、
+  Key 含换行等）都在这里变成 `OpenCodeError::Config`，由 `main` 转成退出码 2。
+  这样做的原因：配置错误必须在任何网络请求之前暴露。
+- `request_brief_with_timeout(...)`：一次 `POST <base-url>/openai/v1/chat/completions`，
+  `Bearer` 认证、`max_tokens = 1200`、`stream = false`、总超时（覆盖读响应体）。
+  它不重试，因为重试意味着可能重复计费。
+- 错误只用受控文案：不拼接 `reqwest`/`serde_json` 的 `Display`，避免把请求 URL
+  或上游返回的非法字段值写进终端。
+
+### 5.9 `brief.rs`：简报的领域规则
+
+- `BriefInput::new(&[NewsItem])`：借用切片、只克隆前 `MAX_INPUT_ITEMS`（50）条。
+  **下标即稳定 ID**：第 0 条的 ID 是 1。提示词里的 ID 和校验引用时的 ID 都来自同一份顺序，
+  所以模型返回的 `source_ids` 才能可靠映射回本地条目。
+- `build_user_prompt()`：把允许外发的字段序列化成 JSON。字段名就是协议，改字段名等于改提示词。
+- `parse_response(&str)`：先把 content 解析成 `RawBrief`（serde 只保证"字段存在且类型对"），
+  再逐条检查语义：概览非空、重点 1–5 个、每项标题/摘要非空、`source_ids` 非空，
+  且每个 ID 都必须落在 `1..=items.len()`。**任何一处不合法都让整份结果作废**，
+  因为半份简报会被误读成完整简报，比明确回退更糟。
+- `render(&Brief, out)`：只输出模型给的文字 + 由本地条目查表得到的来源名称/标题/URL。
+  模型响应里根本没有 URL 字段，所以链接不可能被模型改写。
+
+### 5.10 `main.rs`：程序入口
+
+- `Args`：用 `clap` 库定义顶层参数 `--json` 与可选子命令 `brief`。
+  `args_conflicts_with_subcommands = true` 让 `--json brief` 直接成为用法错误（退出 2）。
 - `main()`：程序从这里开始。它用 `#[tokio::main]` 标记，表示"启动异步运行时"（后面第 7 节解释）。
-- `run()`：执行完整流程，并返回退出码。
+- `run()`：默认列表流程，返回退出码。
+- `collect_today_items()`：`run` 与 `brief` 共用的"获取 → 当天过滤 → 排序"，顺带写源失败警告。
+- `run_brief()` / `run_brief_with_timeout()`：简报流程。超时可注入，测试用 100ms，
+  生产固定 60 秒；AI 失败时回退完整列表并退出 0。
   - 全部源失败：返回 `1`，错误写到标准错误（stderr）。
   - 部分失败：返回 `0`，成功的条目仍然输出，失败的源写到 stderr。
   - 参数错误：返回 `2`（由 clap 自动处理）。
@@ -509,6 +568,14 @@ Mock::given(method("GET")).and(path("/feed"))
 8. `src/main.rs`：把以上串起来。
 9. `tests/fetch.rs`：看假服务器如何模拟各种情况。
 
+第二阶段的建议顺序：**`src/opencode.rs` → `src/brief.rs` → `src/main.rs`**。
+
+1. `opencode.rs`：先看"一次 HTTP 请求怎么写、配置错误怎么提前暴露"（呼应第 8 节 reqwest / 超时）。
+2. `brief.rs`：再看"怎样把模型输出变成可信的领域结构"（呼应 6.2 `Result`、6.3 `Option`、serde）。
+3. `main.rs`：最后看编排与回退（呼应第 4 节流水线与 6.1 借用）。
+4. `tests/opencode.rs`、`src/main.rs` 的 `#[cfg(test)]`：看 wiremock 如何验证请求次数、
+   认证头、超时，以及 writer 失败如何影响退出码。
+
 ### 11.2 动手练习（由易到难）
 
 每个练习都建议先自己写，再和项目对照。**修改代码前先在一个新分支或副本里做**，避免弄乱主线。
@@ -522,6 +589,24 @@ Mock::given(method("GET")).and(path("/feed"))
    **注意**：这是一个"写代码 + 写测试"的练习，目前项目规约只有两个源，正式添加需要另立 OpenSpec 变更。
 6. **跑一次测试并读懂输出**：`cargo test fetch_follows_redirect` 只运行一个测试，观察输出。
 7. **故意让测试失败**：把 `filter_today` 里的 `<` 改成 `<=`，运行 `cargo test`，看哪个测试失败，并解释原因。改完记得还原。
+
+### 11.2b 第二阶段练习（全部离线，不要放真实 Key）
+
+这三个练习都只跑 `cargo test`，**不会访问真实 AI 服务**：
+
+1. **构造无效引用，观察回退**：在 `src/brief.rs` 的测试里把某份简报 JSON 的
+   `source_ids` 改成 `[99]`，运行 `cargo test --lib brief::tests`，确认
+   `parse_response` 返回 `Err`；再到 `src/main.rs` 的 `brief_unknown_source_id_falls_back`
+   观察 CLI 层面如何变成"AI 简报生成失败 + 回退列表 + 退出 0"。
+2. **把输入上限改成 2**：临时把 `MAX_INPUT_ITEMS` 改成 2，运行
+   `cargo test --lib brief::tests`。你会看到 `input_limits_to_latest_50_items` 失败，
+   再看提示词 JSON，确认只发了 2 条。改完记得还原（这是一次"故意让测试失败"的练习）。
+3. **给 mock AI 加 429**：在 `tests/opencode.rs` 里把 `reports_non_2xx_without_retry`
+   的状态码换成你自己的值，或在 `src/main.rs` 的 `brief_ai_429_falls_back_to_original_list`
+   里改状态码，确认 `server.received_requests()` 仍然只有 **1** 条 —— 也就是"不自动重试"。
+
+**注意**：不要把真实 `OPENCODE_API_KEY` 写进代码、测试或文档；测试只使用
+明确的虚构值（测试源码里写作 `oc_sk_` 加 `secret_for_test`），而且会断言它不会出现在输出里。
 
 ### 11.3 调试的基本工具
 
@@ -560,12 +645,45 @@ Rust 标准库不允许 `main` 直接是异步的。`#[tokio::main]` 宏帮你�
 这是 RSS 中表示发布时间的字段，格式是 RFC 2822（如 `Tue, 24 Nov 2026 05:01:00 GMT`）。
 `feed-rs` 会把它解析成统一的时间类型，我们再转换成 UTC+8。
 
+**Q8b：`brief` 失败为什么退出码还是 0？**
+因为回退输出的原始列表本身是可用结果；"这次是不是 AI 简报"由 stderr 说明。
+如果你要写脚本判断，请看 stderr 是否包含"AI 简报生成失败"。
+
+**Q8c：为什么模型不能给我们 URL？**
+因为模型输出不可信。程序只接受引用 ID，再用本地条目补回来源名称、标题和链接，
+这样链接一定指向真实抓到的新闻。
+
 **Q8：为什么只有两个新闻源？**
 这是第一阶段的范围决定。其他源会在后续变更中加入，这样可以逐个验证，避免一次引入太多不确定因素。
 
 ---
 
-## 13. 延伸阅读
+## 13. 第二阶段：AI 简报
+
+这一节把上面各章的通用知识落到新代码上。
+
+**数据流**（与第 4 节呼应）：`collect_today_items` → `BriefInput::new` →
+`build_user_prompt` → `opencode::request_brief_with_timeout` → `parse_response` → `render`。
+
+**新增的几个 Rust 概念**：
+
+- **serde 双层结构**：`opencode.rs` 的 `ChatRequest`（`Serialize`）把 Rust 字段变成 JSON 键；
+  `brief.rs` 的 `RawBrief`（`Deserialize`）把 JSON 变成 Rust 结构。同一份 JSON 用两个类型，
+  是因为"发出去的"和"收进来的"是两份不同的协议。
+- **`Option` 表达协议允许的缺失**：`ChatResponseMessage::content` 是 `Option<String>`，
+  因为协议允许它是 `null`；`None` 必须显式判成错误，而不是当成空字符串。
+- **只解析需要的东西**：响应里的 `choices` 先用 `Vec<serde_json::Value>` 收下，
+  只对第一个元素做严格解析 —— 这样后面畸形的 choice 不会让整份响应失败。
+- **`and_then(|()| out.flush())`**：`render` 成功不代表数据真的到了终端，
+  所以写出之后还要 flush，两步中任一步失败都返回退出码 1。
+- **测试替身**：`FailingWriter` 让 `write`/`flush` 返回错误，用来验证退出码；
+  wiremock 的 `received_requests()` 用来验证"只请求一次"。
+
+**为什么分成两个模块**：`opencode.rs` 只懂 HTTP，`brief.rs` 只懂简报结构，
+`main.rs` 只懂编排。这样 `brief.rs` 的测试不需要网络，`opencode.rs` 的测试不需要
+构造真实新闻，失败时也能一眼看出是哪一层的错。
+
+## 14. 延伸阅读
 
 按主题整理，建议按顺序学习：
 
@@ -586,4 +704,5 @@ Rust 标准库不允许 `main` 直接是异步的。`#[tokio::main]` 宏帮你�
 
 ---
 
-*本文档对应的代码版本：`85e6674` 之后的 `main` 分支。如果代码有改动，请以源码为准。*
+*本文档对应的代码版本：`add-ai-news-briefing` 变更（第二阶段 AI 简报）实现之后的 `master`
+分支；第一阶段内容对应 `85e6674`。如果代码有改动，请以源码为准。*
